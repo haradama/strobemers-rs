@@ -1,0 +1,16 @@
+[package]
+name = "strobemers-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nthash-rs = "0.1.1"
+thiserror = "2.0.12"
+
+[dev-dependencies]
+criterion = "0.6.0"
+rand = "0.9.1"
+
+[[bench]]
+name = "benchmark"
+harness = false
