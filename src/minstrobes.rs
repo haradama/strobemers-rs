@@ -1,6 +1,6 @@
 use crate::{
     constants::DEFAULT_PRIME_NUMBER,
-    hashes::{compute_hashes, compute_min_hashes},
+    hashes::{compute_min_hashes, KmerHasher, NtHash64},
     util::roundup64,
     Result, StrobeError,
 };
@@ -43,35 +43,96 @@ pub struct MinStrobes {
 }
 
 impl MinStrobes {
-    /// Constructs a new `MinStrobes` iterator.
+    /// Constructs a new [`MinStrobes`] iterator using the default hash function (`NtHash64`).
     ///
-    /// Precomputes k-mer hash values and per-window minima for efficient strobemer generation.
+    /// Internally delegates to [`MinStrobes::with_hasher`] with the standard ntHash implementation.
+    /// This function performs all necessary validation and preprocessing to enable
+    /// efficient strobemer generation.
     ///
     /// # Arguments
     ///
-    /// * `seq` – Byte slice of the DNA/RNA sequence.
-    /// * `n` – Order of strobemer (must be 2 or 3).
-    /// * `l` – k-mer length for each strobe (must be between 1 and 64).
-    /// * `w_min` – Minimum window offset (must be ≥ 1).
-    /// * `w_max` – Maximum window offset (must be ≥ `w_min`).
+    /// * `seq` – Input nucleotide sequence as a byte slice (DNA/RNA, ASCII only).
+    /// * `n` – Order of the strobemer (must be 2 or 3).
+    /// * `k` – Length of each strobe segment (k-mer); must be in `[1, 64]`.
+    /// * `w_min` – Minimum offset (in bases) between strobes.
+    /// * `w_max` – Maximum offset (inclusive); must satisfy `w_min ≤ w_max`.
     ///
     /// # Returns
     ///
-    /// * `Ok(Self)` – Successfully initialized `MinStrobes`.
-    /// * `Err(StrobeError)` – Parameter validation or hashing failure.
+    /// * `Ok(MinStrobes)` on success.
+    /// * `Err(StrobeError)` if parameters are invalid or the sequence is too short.
     ///
-    pub fn new(seq: &[u8], n: u8, l: usize, w_min: usize, w_max: usize) -> Result<Self> {
-        // Validate input parameters (sequence, order, window sizes, k-mer length)
-        validate_params!(seq, n, l, w_min, w_max);
+    /// # Example
+    /// ```
+    /// use strobemers_rs::MinStrobes;
+    /// let ms = MinStrobes::new(b"ACGTACGTACGT", 2, 3, 1, 4).unwrap();
+    /// ```
+    pub fn new(seq: &[u8], n: u8, k: usize, w_min: usize, w_max: usize) -> Result<Self> {
+        Self::with_hasher(seq, n, k, w_min, w_max, &NtHash64)
+    }
 
-        // --- Precompute k-mer hashes and window minima ---
-        let hashes = compute_hashes(seq, l)?;
+    /// Constructs a new [`MinStrobes`] iterator with a user-defined hash function.
+    ///
+    /// This method accepts any implementation of the [`KmerHasher`] trait,
+    /// allowing for custom k-mer hashing strategies, such as XOR-based, cryptographic,
+    /// or rolling hashes optimized for performance or reproducibility.
+    ///
+    /// Precomputes:
+    /// - `k`-mer hashes from the sequence using `hasher`
+    /// - Sliding window minima (position and value) for efficient downstream selection
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` – Input DNA/RNA sequence as bytes (e.g., `b"ACGT..."`).
+    /// * `n` – Strobemer order (only 2 or 3 are supported).
+    /// * `k` – Length of each strobe (k-mer), must be `1..=64`.
+    /// * `w_min` – Minimum window offset after the first strobe.
+    /// * `w_max` – Maximum window offset after the first strobe.
+    /// * `hasher` – A reference to a type implementing the [`KmerHasher`] trait.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(MinStrobes)` – Ready-to-use iterator for strobemers.
+    /// * `Err(StrobeError)` – On invalid parameters or hash failure.
+    ///
+    /// # Example
+    /// ```
+    /// use strobemers_rs::{MinStrobes, KmerHasher};
+    ///
+    /// struct DummyHasher;
+    /// impl KmerHasher for DummyHasher {
+    ///     fn hash_all(&self, seq: &[u8], k: usize) -> strobemers_rs::Result<Vec<u64>> {
+    ///         Ok(seq.windows(k).map(|w| w.iter().map(|b| *b as u64).sum()).collect())
+    ///     }
+    /// }
+    ///
+    /// let hasher = DummyHasher;
+    /// let ms = MinStrobes::with_hasher(b"ACGTACGT", 2, 3, 1, 4, &hasher).unwrap();
+    /// ```
+    pub fn with_hasher<H>(
+        seq: &[u8],
+        n: u8,
+        k: usize,
+        w_min: usize,
+        w_max: usize,
+        hasher: &H,
+    ) -> Result<Self>
+    where
+        H: KmerHasher,
+    {
+        // Check all preconditions
+        validate_params!(seq, n, k, w_min, w_max);
+
+        // Compute k-mer hash values via user-supplied hasher
+        let hashes = hasher.hash_all(seq, k)?;
+
+        // Precompute min-hash locations and values within each sliding window
         let (minloc, minval) = compute_min_hashes(&hashes, w_max - w_min + 1);
 
-        // Compute the last valid index for selecting m1 such that all strobes fit
+        // Define range bounds for m1 (starting point of each strobemer)
         let seq_len = seq.len();
-        let end_hash = seq_len - l; // last index where a k-mer hash exists
-        let end_idx = seq_len - l - (n as usize - 1) * l;
+        let end_hash = seq_len - k;
+        let end_idx = seq_len - k - (n as usize - 1) * k;
 
         Ok(Self {
             n,
@@ -85,8 +146,8 @@ impl MinStrobes {
             end_idx,
             idx2: 0,
             idx3: 0,
-            prime: DEFAULT_PRIME_NUMBER, // default Mersenne prime (2^20 - 1)
-            shrink: true,                // allow shrinking windows near the end
+            prime: DEFAULT_PRIME_NUMBER,
+            shrink: true,
             h1: 0,
             h2: 0,
             h3: 0,

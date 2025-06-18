@@ -2,6 +2,36 @@ use std::collections::VecDeque;
 use nthash_rs::kmer::NtHashBuilder;
 use crate::{Result, StrobeError};
 
+pub trait KmerHasher: Send + Sync + 'static {
+    fn hash_all(&self, seq: &[u8], k: usize) -> Result<Vec<u64>>;
+}
+
+pub struct NtHash64;
+impl Default for NtHash64 { fn default() -> Self { Self } }
+
+impl KmerHasher for NtHash64 {
+    fn hash_all(&self, seq: &[u8], k: usize) -> Result<Vec<u64>> {
+        if !(1..=64).contains(&k) {
+            return Err(StrobeError::StrobeLengthTooSmall);
+        }
+        if seq.len() < k {
+            return Err(StrobeError::SequenceTooShort);
+        }
+
+        let it = NtHashBuilder::new(seq)
+            .k(k as u16)
+            .num_hashes(1)
+            .finish()
+            .map_err(StrobeError::from)?;
+
+        let mut out = Vec::with_capacity(seq.len() - k + 1);
+        for (_, h) in it {
+            out.push(h[0]);
+        }
+        Ok(out)
+    }
+}
+
 /// Generates k-mer hash values from the given sequence `seq`, using exactly one hash per k-mer.
 /// 
 /// # Parameters

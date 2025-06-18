@@ -7,7 +7,7 @@ mod randstrobes;
 
 pub use constants::*;
 pub use util::*;
-pub use hashes::{compute_hashes, compute_min_hashes};
+pub use hashes::{compute_hashes, compute_min_hashes, KmerHasher};
 pub use minstrobes::MinStrobes;
 pub use randstrobes::RandStrobes;
 

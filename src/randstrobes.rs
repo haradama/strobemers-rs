@@ -1,6 +1,6 @@
 use crate::{
     constants::DEFAULT_PRIME_NUMBER,
-    hashes::compute_hashes,
+    hashes::{KmerHasher, NtHash64},
     util::roundup64,
     Result, StrobeError,
 };
@@ -15,7 +15,7 @@ use crate::{
 pub struct RandStrobes {
     // Parameters controlling strobemer generation
     n:      u8,      // Order of strobemer: 2 or 3
-    _l:     usize,   // k-mer length (only needed during construction)
+    _k:     usize,   // k-mer length (only needed during construction)
     w_min:  usize,   // Minimum window offset
     w_max:  usize,   // Maximum window offset
 
@@ -42,38 +42,105 @@ pub struct RandStrobes {
 }
 
 impl RandStrobes {
-    /// Constructs a new `RandStrobes` iterator.
+    /// Constructs a new [`RandStrobes`] iterator using the default hash function (`NtHash64`).
     ///
-    /// Precomputes k-mer hashes and initializes state for pseudo-random strobemer selection.
+    /// This method serves as a convenience wrapper for [`RandStrobes::with_hasher`],
+    /// providing a standard ntHash-based setup for k-mer hashing.
+    ///
+    /// The generated iterator will produce strobemers using the **RandStrobe protocol**,
+    /// where the second (and optionally third) k-mer is selected based on a minimum
+    /// of a randomized hash function over a windowed region.
     ///
     /// # Arguments
     ///
-    /// * `seq` – Byte slice of the DNA/RNA sequence.
-    /// * `n` – Order of strobemer (must be 2 or 3).
-    /// * `l` – k-mer length for each strobe (must be between 1 and 64).
-    /// * `w_min` – Minimum window offset (must be ≥ 1).
-    /// * `w_max` – Maximum window offset (must be ≥ `w_min`).
+    /// * `seq` – Nucleotide sequence as a byte slice (e.g., `b"ACGT..."`). Must be ASCII.
+    /// * `n` – Strobemer order (2 or 3 only).
+    /// * `k` – k-mer length for each strobe. Must be between 1 and 64 (inclusive).
+    /// * `w_min` – Minimum window offset for selecting the next strobe.
+    /// * `w_max` – Maximum window offset (inclusive); must satisfy `w_min ≤ w_max`.
     ///
     /// # Returns
     ///
-    /// * `Ok(Self)` – Successfully initialized `RandStrobes`.
-    /// * `Err(StrobeError)` – Parameter validation or hashing failure.
+    /// * `Ok(RandStrobes)` – Ready-to-use iterator for random strobemers.
+    /// * `Err(StrobeError)` – Returned if parameters are invalid or the sequence is too short.
     ///
-    pub fn new(seq: &[u8], n: u8, l: usize, w_min: usize, w_max: usize) -> Result<Self> {
-        // Validate input parameters (sequence, order, window sizes, k-mer length)
-        validate_params!(seq, n, l, w_min, w_max);
+    /// # Example
+    /// ```
+    /// use strobemers_rs::RandStrobes;
+    /// let rs = RandStrobes::new(b"ACGTACGTACGT", 2, 3, 1, 4).unwrap();
+    /// for h in rs.take(5) {
+    ///     println!("{}", h);
+    /// }
+    /// ```
+    pub fn new(seq: &[u8], n: u8, k: usize, w_min: usize, w_max: usize) -> Result<Self> {
+        Self::with_hasher(seq, n, k, w_min, w_max, &NtHash64)
+    }
 
-        // Precompute k-mer hash values
-        let hashes = compute_hashes(seq, l)?;
+    /// Constructs a new [`RandStrobes`] iterator using a user-defined k-mer hash function.
+    ///
+    /// This method enables **dependency injection** of the hashing algorithm via the [`KmerHasher`] trait.
+    /// It allows experimentation with custom hashers (e.g. fast XOR, cryptographic, locality-aware) for advanced use cases.
+    ///
+    /// The resulting iterator emits strobemer hashes using the **RandStrobe method**:
+    /// - The first k-mer is fixed at position `i`
+    /// - The next k-mer is chosen within a window `[i + w_min ..= i + w_max]`
+    ///   to **minimize a masked combination** `(h₁ + h₂) & prime`
+    /// - If `n = 3`, the third k-mer is chosen similarly after `w_max + w_min`
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` – Input DNA/RNA sequence as ASCII bytes.
+    /// * `n` – Order of the strobemer (must be 2 or 3).
+    /// * `k` – Length of each strobe (k-mer), within the inclusive range [1, 64].
+    /// * `w_min` – Minimum offset for the search window (must be ≥ 1).
+    /// * `w_max` – Maximum offset (inclusive); must satisfy `w_min ≤ w_max`.
+    /// * `hasher` – Reference to a [`KmerHasher`] implementation for computing all k-mer hashes.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(RandStrobes)` – If input and hashes are valid.
+    /// * `Err(StrobeError)` – On invalid input, hashing errors, or insufficient sequence length.
+    ///
+    /// # Example
+    /// ```
+    /// use strobemers_rs::{RandStrobes, KmerHasher};
+    ///
+    /// struct DummyHasher;
+    /// impl KmerHasher for DummyHasher {
+    ///     fn hash_all(&self, seq: &[u8], k: usize) -> strobemers_rs::Result<Vec<u64>> {
+    ///         Ok(seq.windows(k).map(|w| w.iter().map(|b| *b as u64).sum()).collect())
+    ///     }
+    /// }
+    ///
+    /// let rs = RandStrobes::with_hasher(b"ACGTACGT", 2, 3, 1, 4, &DummyHasher).unwrap();
+    /// for h in rs.take(3) {
+    ///     println!("strobemer hash: {}", h);
+    /// }
+    /// ```
+    pub fn with_hasher<H>(
+        seq: &[u8],
+        n: u8,
+        k: usize,
+        w_min: usize,
+        w_max: usize,
+        hasher: &H,
+    ) -> Result<Self>
+    where
+        H: KmerHasher,
+    {
+        // Ensure all parameters are valid before proceeding
+        validate_params!(seq, n, k, w_min, w_max);
 
-        // Compute last valid hash index (sequence length minus k-mer length)
-        let end_hash = seq.len().saturating_sub(l);
-        // Compute last valid starting index for a full strobemer (n*k-mer segments)
-        let end_idx = seq.len().saturating_sub(l + (n as usize - 1) * l);
+        // Precompute hash values for all valid k-mers
+        let hashes = hasher.hash_all(seq, k)?;
+
+        // Calculate the valid iteration bounds
+        let end_hash = seq.len().saturating_sub(k); // maximum hash index
+        let end_idx = seq.len().saturating_sub(k + (n as usize - 1) * k); // max starting index for m₁
 
         Ok(Self {
             n,
-            _l: l,
+            _k: k,
             w_min,
             w_max,
             hashes,
@@ -82,8 +149,8 @@ impl RandStrobes {
             end_hash,
             idx2: 0,
             idx3: 0,
-            prime: DEFAULT_PRIME_NUMBER, // default Mersenne prime (2^20 − 1)
-            shrink: true,                // allow shrinking windows near the end
+            prime: DEFAULT_PRIME_NUMBER,
+            shrink: true,
             h1: 0,
             h2: 0,
             h3: 0,
