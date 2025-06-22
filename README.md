@@ -76,6 +76,11 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
+## Using a Custom Hash Function
+
+By default, strobemers-rs uses [nthash-rs](https://github.com/haradama/nthash-rs) for k-mer hashing.
+However, you can inject your own hash function by implementing the `KmerHasher` trait and passing it via the with_hasher method. See [the example](./examples/custom_hash.rs) for more details.
+
 ## License
 
 This project is MIT‑licensed (see [LICENSE](LICENSE)).
