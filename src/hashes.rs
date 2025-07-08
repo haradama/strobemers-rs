@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use nthash_rs::kmer::NtHashBuilder;
 use crate::{Result, StrobeError};
 
@@ -62,25 +61,21 @@ pub fn compute_hashes(seq: &[u8], k: usize) -> Result<Vec<u64>> {
         .finish()
         .map_err(StrobeError::from)?; // Convert NtHashError into StrobeError
 
-    let capacity = seq.len() - k + 1;
-    let mut hashes = Vec::with_capacity(capacity);
-
-    // For each position, `iter` yields (start_index, [hash_values...])
-    // We only take the first hash in the returned array.
-    for (_, h_array) in iter {
-        hashes.push(h_array[0]);
+    let len = seq.len() - k + 1;
+    let mut hashes = vec![0u64; len];   // 一気に確保 & 初期化
+    for (i, (_, h)) in iter.enumerate() {
+        hashes[i] = h[0];
     }
 
     // Sanity check: we should have exactly one hash per k-mer position
-    if hashes.len() != capacity {
+    if hashes.len() != len {
         return Err(StrobeError::IncompleteHashValues);
     }
     Ok(hashes)
 }
 
 /// For a sliding window of width `w` over the given slice of hash values,
-/// computes the index and value of the minimum hash in each window. Runs in O(N) time
-/// by maintaining a monotonic (increasing) queue of candidates.
+/// computes the index and value of the minimum hash in each window.
 ///
 /// # Parameters
 /// - `hashes`: slice of u64 hash values to slide over
@@ -97,46 +92,45 @@ pub fn compute_min_hashes(hashes: &[u64], w: usize) -> (Vec<usize>, Vec<u64>) {
     assert!(w >= 1, "window size must be ≥ 1");
     let n = hashes.len();
 
-    // Trivial case: window size of 1 → each position is its own minimum
     if w == 1 {
-        let locs: Vec<usize> = (0..n).collect();
-        let mins = hashes.to_vec();
-        return (locs, mins);
+        return ((0..n).collect(), hashes.to_vec());
     }
 
-    // Prepare output vectors: default locs=0, mins=MAX (for positions < w-1)
-    let mut locs = vec![0; n];
+    let mut locs = vec![0usize; n];
     let mut mins = vec![u64::MAX; n];
-    
-    // Monotonic queue: stores (index, value) pairs in increasing order of value
-    let mut dq: VecDeque<(usize, u64)> = VecDeque::with_capacity(w);
 
-    for (idx, &h) in hashes.iter().enumerate() {
-        // Pop from back while the back's hash is ≥ current hash `h`,
-        // ensuring that only strictly smaller values remain earlier in queue.
-        while matches!(dq.back(), Some(&(_, back_h)) if back_h >= h) {
-            dq.pop_back();
-        }
-        // Push the current (idx, h) onto the back
-        dq.push_back((idx, h));
+    let mut idx_q = vec![0usize; w];
+    let mut val_q = vec![0u64;   w];
+    let mut head = 0usize;
+    let mut len  = 0usize;
 
-        // Determine the start of the sliding window that ends at `idx`
-        let window_start = idx.saturating_sub(w - 1);
-
-        // Pop from front if that element's index is outside the current window
-        while matches!(dq.front(), Some(&(front_idx, _)) if front_idx < window_start) {
-            dq.pop_front();
-        }
-
-        // Once we've processed at least w elements, record the minimum for this window
-        if idx >= w - 1 {
-            // The front of the deque is the (index, value) of the minimum
-            let (min_pos, min_val) = dq.front().copied().unwrap();
-            locs[idx] = min_pos;
-            mins[idx] = min_val;
-        }
+    #[inline(always)]
+    fn pos(off: usize, head: usize, cap: usize) -> usize {
+        let p = head + off;
+        if p >= cap { p - cap } else { p }
     }
 
+    for (i, &h) in hashes.iter().enumerate() {
+        let window_start = i.saturating_sub(w - 1);
+        while len > 0 && idx_q[head] < window_start {
+            head = pos(1, head, w);
+            len -= 1;
+        }
+
+        while len > 0 && val_q[pos(len - 1, head, w)] >= h {
+            len -= 1;
+        }
+
+        let tail = pos(len, head, w);
+        idx_q[tail] = i;
+        val_q[tail] = h;
+        len += 1;
+
+        if i >= w - 1 {
+            locs[i] = idx_q[head];
+            mins[i] = val_q[head];
+        }
+    }
     (locs, mins)
 }
 
