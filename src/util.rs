@@ -18,9 +18,9 @@ use crate::constants::{COMPL_BASES, SEQ_NT4_TABLE};
 /// # Returns
 ///
 /// * The smallest power of two greater than or equal to `x`.
-#[inline]
+#[inline(always)]
 pub const fn roundup64(x: u64) -> u64 {
-    ((x | 1).saturating_sub(1)).next_power_of_two()
+    x.next_power_of_two()
 }
 
 /// Returns the complementary DNA/RNA base for the given ASCII byte.
@@ -35,7 +35,7 @@ pub const fn roundup64(x: u64) -> u64 {
 /// # Returns
 ///
 /// * The ASCII byte for the complementary base, or `b'N'` if outside A/C/G/T/U.
-#[inline]
+#[inline(always)]
 pub const fn complement(b: u8) -> u8 {
     COMPL_BASES[b as usize]
 }
@@ -56,7 +56,7 @@ pub const fn complement(b: u8) -> u8 {
 /// # Returns
 ///
 /// * A 2-bit encoding (0..=3) for valid nucleotides, or 4 for any other byte.
-#[inline]
+#[inline(always)]
 pub const fn nt4(b: u8) -> u8 {
     SEQ_NT4_TABLE[b as usize]
 }

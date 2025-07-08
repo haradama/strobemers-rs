@@ -213,18 +213,17 @@ impl RandStrobes {
     ///
     /// *(best_pos, best_val)* – Index of the chosen k-mer and the resulting combined hash value.
     ///
-    fn choose_min(&self, base_hash: u64, range: std::ops::RangeInclusive<usize>) -> (usize, u64) {
-        let mut best_pos = *range.start();
+    #[inline(always)]
+    fn choose_min(&self, base: u64, start: usize, end: usize) -> (usize, u64) {
+
+        let mut best_pos = start;
         let mut best_val = u64::MAX;
 
-        for pos in range {
-            // Wrap-around addition, then bitwise AND with prime (Mersenne prime mask)
-            let cand = base_hash
-                .wrapping_add(self.hashes[pos])
-                & self.prime;
+        for (rel, &h) in self.hashes[start..=end].iter().enumerate() {
+            let cand = base.wrapping_add(h) & self.prime;
             if cand < best_val {
                 best_val = cand;
-                best_pos = pos;
+                best_pos = start + rel;
             }
         }
         (best_pos, best_val)
@@ -256,7 +255,7 @@ impl RandStrobes {
         // Hash of the first k-mer (m1)
         self.h1 = self.hashes[self.idx];
         // Choose m2 by minimizing `(h1 + hash[m2]) & prime`
-        let (pos2, _) = self.choose_min(self.h1, w_start..=w_end);
+        let (pos2, _) = self.choose_min(self.h1, w_start, w_end);
         self.idx2 = pos2;
         // Combine h1 and second k-mer’s hash
         self.h2 = self.h1 / 2 + self.hashes[pos2] / 3;
@@ -297,12 +296,12 @@ impl RandStrobes {
         // Compute m1 (first k-mer)
         self.h1 = self.hashes[self.idx];
         // Select m2
-        let (pos2, _) = self.choose_min(self.h1, w1_start..=w1_end);
+        let (pos2, _) = self.choose_min(self.h1, w1_start, w1_end);
         self.idx2 = pos2;
         self.h2 = self.h1 / 3 + self.hashes[pos2] / 4;
 
         // Select m3
-        let (pos3, _) = self.choose_min(self.h2, w2_start..=w2_end);
+        let (pos3, _) = self.choose_min(self.h2, w2_start, w2_end);
         self.idx3 = pos3;
         self.h3 = self.h2 + self.hashes[pos3] / 5;
 
