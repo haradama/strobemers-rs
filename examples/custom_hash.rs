@@ -1,6 +1,4 @@
-use strobemers_rs::{
-    MinStrobes, RandStrobes, KmerHasher
-};
+use strobemers_rs::{KmerHasher, MinStrobes, RandStrobes};
 
 struct XorHasher;
 
@@ -28,16 +26,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let xor_hasher = XorHasher;
 
-    println!("== RandStrobes using XorHasher ==");
-    let mut rs = RandStrobes::with_hasher(seq, order, k, w_min, w_max, &xor_hasher)?;
-    for (i, h) in rs.by_ref().take(5).enumerate() {
-        println!("RandStrobe {i}: {:x}", h);
-    }
-
     println!("\n== MinStrobes using XorHasher ==");
     let mut ms = MinStrobes::with_hasher(seq, order, k, w_min, w_max, &xor_hasher)?;
     for (i, h) in ms.by_ref().take(5).enumerate() {
         println!("MinStrobe {i}: {:x}", h);
+    }
+
+    println!("== RandStrobes using XorHasher ==");
+    let mut rs = RandStrobes::with_hasher(seq, order, k, w_min, w_max, &xor_hasher)?;
+    for (i, h) in rs.by_ref().take(5).enumerate() {
+        println!("RandStrobe {i}: {:x}", h);
     }
 
     Ok(())

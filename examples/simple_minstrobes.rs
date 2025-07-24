@@ -7,13 +7,13 @@ fn main() -> Result<()> {
     // Sequence to process (25 nucleotides)
     let seq = "ATCGTACGATGCATGCATGCTGACG";
     // Order of strobemer: 2 (dimer) or 3 (trimer)
-    let n        = 2;
+    let n = 2;
     // Length of each k-mer (strobe). Must be between 1 and 64.
-    let l        = 6;
+    let l = 6;
     // Minimum window offset for selecting the next strobe
-    let w_min    = 4;
+    let w_min = 4;
     // Maximum window offset for selecting the next strobe
-    let w_max    = 12;
+    let w_max = 12;
 
     // ---------------------------------------------------- //
     // 2. Instantiate a MinStrobes iterator
