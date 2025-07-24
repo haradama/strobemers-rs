@@ -7,9 +7,9 @@ use strobemers_rs::{MinStrobes, RandStrobes, Result};
 
 // ==== Fixed parameters (identical to the original Go tests) ====
 const SEQ: &[u8] = b"ACGATCTGGTACCTAG"; // Test sequence
-const L: usize = 3;                      // k-mer (strobe) length
-const W_MIN: usize = 3;                  // Minimum window offset
-const W_MAX: usize = 5;                  // Maximum window offset
+const L: usize = 3; // k-mer (strobe) length
+const W_MIN: usize = 3; // Minimum window offset
+const W_MAX: usize = 5; // Maximum window offset
 
 // ==== Snapshot of expected hash outputs (as of 2025-06-03 commit) ====
 //

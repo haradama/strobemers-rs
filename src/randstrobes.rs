@@ -1,8 +1,8 @@
 use crate::{
+    Result, StrobeError,
     constants::DEFAULT_PRIME_NUMBER,
     hashes::{KmerHasher, NtHash64},
     util::roundup64,
-    Result, StrobeError,
 };
 
 /// Iterator for generating RandStrobes of order 2 or 3 from a DNA/RNA sequence.
@@ -14,17 +14,17 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct RandStrobes {
     // Parameters controlling strobemer generation
-    n:      u8,      // Order of strobemer: 2 or 3
-    _k:     usize,   // k-mer length (only needed during construction)
-    w_min:  usize,   // Minimum window offset
-    w_max:  usize,   // Maximum window offset
+    n: u8,        // Order of strobemer: 2 or 3
+    _k: usize,    // k-mer length (only needed during construction)
+    w_min: usize, // Minimum window offset
+    w_max: usize, // Maximum window offset
 
     // Precomputed data
     hashes: Vec<u64>, // Hash values for each k-mer in the sequence
 
     // Iteration state
-    idx:      usize, // Current index of the first k-mer (m1)
-    end_idx:  usize, // Last index at which a complete strobemer can start
+    idx: usize,      // Current index of the first k-mer (m1)
+    end_idx: usize,  // Last index at which a complete strobemer can start
     end_hash: usize, // Last index in `hashes` (i.e., sequence length minus k)
 
     // Strobe indices for current item
@@ -32,7 +32,7 @@ pub struct RandStrobes {
     idx3: usize, // Index of third k-mer (m3) if order = 3
 
     // Prime number and shrink-window flag
-    prime: u64,  // Used for mask-based combination: `(base_hash + candidate_hash) & prime`
+    prime: u64, // Used for mask-based combination: `(base_hash + candidate_hash) & prime`
     shrink: bool, // Whether to shrink windows near the end if the full window does not fit
 
     // Working registers for hash values
@@ -215,7 +215,6 @@ impl RandStrobes {
     ///
     #[inline(always)]
     fn choose_min(&self, base: u64, start: usize, end: usize) -> (usize, u64) {
-
         let mut best_pos = start;
         let mut best_val = u64::MAX;
 

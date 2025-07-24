@@ -1,8 +1,8 @@
 use crate::{
-    constants::DEFAULT_PRIME_NUMBER,
-    hashes::{compute_min_hashes, KmerHasher, NtHash64},
-    util::roundup64,
     Result, StrobeError,
+    constants::DEFAULT_PRIME_NUMBER,
+    hashes::{KmerHasher, NtHash64, compute_min_hashes},
+    util::roundup64,
 };
 
 /// Iterator for generating MinStrobes of order 2 or 3 from a DNA/RNA sequence.
@@ -14,9 +14,9 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct MinStrobes {
     // Parameters controlling strobemer generation
-    n:      u8,       // Order of strobemer: 2 or 3
-    w_min:  usize,    // Minimum window offset
-    w_max:  usize,    // Maximum window offset
+    n: u8,        // Order of strobemer: 2 or 3
+    w_min: usize, // Minimum window offset
+    w_max: usize, // Maximum window offset
 
     // Precomputed data
     hashes: Vec<u64>,   // Hash values for each k-mer in the sequence
@@ -24,8 +24,8 @@ pub struct MinStrobes {
     minval: Vec<u64>,   // Minimum hash value within each sliding window
 
     // Iteration state
-    idx:      usize, // Current index of the first k-mer (m1)
-    end_idx:  usize, // Last index at which a complete strobemer can start
+    idx: usize,      // Current index of the first k-mer (m1)
+    end_idx: usize,  // Last index at which a complete strobemer can start
     end_hash: usize, // Last index in `hashes` (i.e., sequence length minus k)
 
     // Strobe indices for current item
@@ -33,7 +33,7 @@ pub struct MinStrobes {
     idx3: usize, // Index of third k-mer (m3) if order = 3
 
     // Prime number and shrink-window flag
-    prime: u64,  // Used for combining hash values in order 3
+    prime: u64,   // Used for combining hash values in order 3
     shrink: bool, // Whether to shrink windows near sequence end
 
     // Working registers for hash values

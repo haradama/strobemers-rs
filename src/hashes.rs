@@ -1,12 +1,16 @@
-use nthash_rs::kmer::NtHashBuilder;
 use crate::{Result, StrobeError};
+use nthash_rs::kmer::NtHashBuilder;
 
 pub trait KmerHasher: Send + Sync + 'static {
     fn hash_all(&self, seq: &[u8], k: usize) -> Result<Vec<u64>>;
 }
 
 pub struct NtHash64;
-impl Default for NtHash64 { fn default() -> Self { Self } }
+impl Default for NtHash64 {
+    fn default() -> Self {
+        Self
+    }
+}
 
 impl KmerHasher for NtHash64 {
     fn hash_all(&self, seq: &[u8], k: usize) -> Result<Vec<u64>> {
@@ -32,7 +36,7 @@ impl KmerHasher for NtHash64 {
 }
 
 /// Generates k-mer hash values from the given sequence `seq`, using exactly one hash per k-mer.
-/// 
+///
 /// # Parameters
 /// - `seq`: byte slice representing the DNA/RNA sequence
 /// - `k`: length of each k-mer (must be between 1 and 64, inclusive)
@@ -62,7 +66,7 @@ pub fn compute_hashes(seq: &[u8], k: usize) -> Result<Vec<u64>> {
         .map_err(StrobeError::from)?; // Convert NtHashError into StrobeError
 
     let len = seq.len() - k + 1;
-    let mut hashes = vec![0u64; len];   // 一気に確保 & 初期化
+    let mut hashes = vec![0u64; len]; // 一気に確保 & 初期化
     for (i, (_, h)) in iter.enumerate() {
         hashes[i] = h[0];
     }
@@ -100,9 +104,9 @@ pub fn compute_min_hashes(hashes: &[u64], w: usize) -> (Vec<usize>, Vec<u64>) {
     let mut mins = vec![u64::MAX; n];
 
     let mut idx_q = vec![0usize; w];
-    let mut val_q = vec![0u64;   w];
+    let mut val_q = vec![0u64; w];
     let mut head = 0usize;
-    let mut len  = 0usize;
+    let mut len = 0usize;
 
     #[inline(always)]
     fn pos(off: usize, head: usize, cap: usize) -> usize {
