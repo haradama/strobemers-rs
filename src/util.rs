@@ -2,14 +2,9 @@ use crate::constants::{COMPL_BASES, SEQ_NT4_TABLE};
 
 /// Rounds up the given value `x` to the next power of two.
 ///
-/// Internally:
-/// 1. Ensures `x` is odd by OR’ing with 1.
-/// 2. Subtracts 1 to handle exact powers-of-two correctly.
-/// 3. Calls `.next_power_of_two()` to obtain the next power-of-two boundary.
-///
 /// Examples:
-/// - `roundup64(5)` → 8
-/// - `roundup64(8)` → 8
+/// - `roundup64(5)` -> 8
+/// - `roundup64(8)` -> 8
 ///
 /// # Arguments
 ///
@@ -86,7 +81,7 @@ pub const fn nt4(b: u8) -> u8 {
 macro_rules! validate_params {
     ($seq:expr, $n:expr, $l:expr, $w_min:expr, $w_max:expr) => {{
         // Sequence must be non-empty
-        if $seq.is_empty() {
+        if $seq.is_empty() || !$seq.is_ascii() {
             return Err(StrobeError::InvalidSequence);
         }
         // Order must be exactly 2 or 3

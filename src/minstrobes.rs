@@ -224,7 +224,7 @@ impl MinStrobes {
         if w_end == self.idx + self.w_max {
             self.idx2 = self.minloc[w_end];
             // Combine h1 and precomputed minimum hash
-            self.h2 = self.h1 / 2 + self.minval[w_end] / 3;
+            self.h2 = (self.h1 >> 1) + self.minval[w_end] / 3;
         } else {
             // Partial window: manually scan to find minimum
             let (mut best_hash, mut best_pos) = (u64::MAX, w_start);
@@ -278,7 +278,7 @@ impl MinStrobes {
         self.h1 = self.hashes[self.idx];
         // Select m2 using precomputed minima at window end
         self.idx2 = self.minloc[w_end];
-        self.h2 = self.h1 / 3 + self.minval[w_end] / 4;
+        self.h2 = self.h1 / 3 + (self.minval[w_end] >> 2);
 
         // Select m3
         if w2_end == self.idx + (self.w_max << 1) {

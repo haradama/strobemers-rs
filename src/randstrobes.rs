@@ -215,19 +215,21 @@ impl RandStrobes {
     ///
     #[inline(always)]
     fn choose_min(&self, base: u64, start: usize, end: usize) -> (usize, u64) {
+        let hashes  = &self.hashes;
+        let prime   = self.prime;
+
         let mut best_pos = start;
         let mut best_val = u64::MAX;
 
-        for (rel, &h) in self.hashes[start..=end].iter().enumerate() {
-            let cand = base.wrapping_add(h) & self.prime;
+        for i in start..=end {
+            let cand = base.wrapping_add(hashes[i]) & prime;
             if cand < best_val {
                 best_val = cand;
-                best_pos = start + rel;
+                best_pos = i;
             }
         }
         (best_pos, best_val)
     }
-
     // -------------------- order-specific next ---------------------------- //
 
     /// Computes the next RandStrobe hash value for order 2.
@@ -257,7 +259,7 @@ impl RandStrobes {
         let (pos2, _) = self.choose_min(self.h1, w_start, w_end);
         self.idx2 = pos2;
         // Combine h1 and second k-mer’s hash
-        self.h2 = self.h1 / 2 + self.hashes[pos2] / 3;
+        self.h2 = (self.h1 >> 1) + self.hashes[pos2] / 3;
 
         // Advance to next starting index for m1
         self.idx += 1;
@@ -297,7 +299,7 @@ impl RandStrobes {
         // Select m2
         let (pos2, _) = self.choose_min(self.h1, w1_start, w1_end);
         self.idx2 = pos2;
-        self.h2 = self.h1 / 3 + self.hashes[pos2] / 4;
+        self.h2 = self.h1 / 3     + (self.hashes[pos2] >> 2);
 
         // Select m3
         let (pos3, _) = self.choose_min(self.h2, w2_start, w2_end);

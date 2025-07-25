@@ -65,24 +65,18 @@ pub fn compute_min_hashes(hashes: &[u64], w: usize) -> (Vec<usize>, Vec<u64>) {
     let mut head = 0usize;
     let mut len = 0usize;
 
-    #[inline(always)]
-    fn pos(off: usize, head: usize, cap: usize) -> usize {
-        let p = head + off;
-        if p >= cap { p - cap } else { p }
-    }
-
     for (i, &h) in hashes.iter().enumerate() {
         let window_start = i.saturating_sub(w - 1);
         while len > 0 && idx_q[head] < window_start {
-            head = pos(1, head, w);
+            head = (head + 1) % w;
             len -= 1;
         }
 
-        while len > 0 && val_q[pos(len - 1, head, w)] >= h {
+        while len > 0 && val_q[(head + len - 1) % w] >= h {
             len -= 1;
         }
 
-        let tail = pos(len, head, w);
+        let tail = (head + len) % w;
         idx_q[tail] = i;
         val_q[tail] = h;
         len += 1;
