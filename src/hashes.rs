@@ -35,49 +35,6 @@ impl KmerHasher for NtHash64 {
     }
 }
 
-/// Generates k-mer hash values from the given sequence `seq`, using exactly one hash per k-mer.
-///
-/// # Parameters
-/// - `seq`: byte slice representing the DNA/RNA sequence
-/// - `k`: length of each k-mer (must be between 1 and 64, inclusive)
-///
-/// # Returns
-/// - `Ok(Vec<u64>)`: a vector of hash values, one per k-mer, in sequential order
-/// - `Err(StrobeError::StrobeLengthTooSmall)`: if `k` is outside the valid range (1..=64)
-/// - `Err(StrobeError::SequenceTooShort)`: if `seq.len() < k`
-/// - `Err(StrobeError::IncompleteHashValues)`: if the number of hashes computed does not match `seq.len() - k + 1`
-///
-pub fn compute_hashes(seq: &[u8], k: usize) -> Result<Vec<u64>> {
-    // Validate k is within [1, 64]
-    if !(1..=64).contains(&k) {
-        return Err(StrobeError::StrobeLengthTooSmall);
-    }
-    // Ensure the sequence length is sufficient for at least one k-mer
-    if seq.len() < k {
-        return Err(StrobeError::SequenceTooShort);
-    }
-
-    // Build the NtHash iterator: `k` specifies the k-mer length,
-    // `num_hashes(1)` means we only care about the first hash for each k-mer
-    let iter = NtHashBuilder::new(seq)
-        .k(k as u16)
-        .num_hashes(1)
-        .finish()
-        .map_err(StrobeError::from)?; // Convert NtHashError into StrobeError
-
-    let len = seq.len() - k + 1;
-    let mut hashes = vec![0u64; len]; // 一気に確保 & 初期化
-    for (i, (_, h)) in iter.enumerate() {
-        hashes[i] = h[0];
-    }
-
-    // Sanity check: we should have exactly one hash per k-mer position
-    if hashes.len() != len {
-        return Err(StrobeError::IncompleteHashValues);
-    }
-    Ok(hashes)
-}
-
 /// For a sliding window of width `w` over the given slice of hash values,
 /// computes the index and value of the minimum hash in each window.
 ///

@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use strobemers_rs::{compute_hashes, MinStrobes, RandStrobes};
+use strobemers_rs::{MinStrobes, RandStrobes};
 
 use rand::{Rng, SeedableRng};
 use std::hint::black_box;
@@ -15,15 +15,6 @@ fn make_seq() -> Vec<u8> {
     (0..100_000)
         .map(|_| BASES[rng.random_range(0..4)])
         .collect()
-}
-
-fn bench_compute_hashes(c: &mut Criterion) {
-    let seq = make_seq();
-    c.bench_function("compute_hashes 100 kbp", |b| {
-        b.iter(|| {
-            black_box(compute_hashes(&seq, L).unwrap());
-        })
-    });
 }
 
 fn bench_minstrobes_iter(c: &mut Criterion) {
@@ -48,7 +39,6 @@ fn bench_randstrobes_iter(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_compute_hashes,
     bench_minstrobes_iter,
     bench_randstrobes_iter
 );
