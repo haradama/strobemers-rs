@@ -11,7 +11,9 @@ Streaming iterators produce 64-bit strobemer hashes over DNA/RNA sequences.
 > **Background**  
 >
 > - The original strobemer concept and reference implementation live at [ksahlin/strobemers](https://github.com/ksahlin/strobemers).  
-> - This crate’s design was guided by the Go port found at [shenwei356/strobemers](https://github.com/shenwei356/strobemers), but the code here is a complete Rust‐native rewrite (zero `unsafe`).  
+> - This crate’s design was guided by the Go port found at [shenwei356/strobemers](https://github.com/shenwei356/strobemers), but the code here is a complete Rust‐native rewrite (zero `unsafe`).
+> - Strobe selection is verified against that Go port value-by-value in `tests/go_conformance.rs`. Hash *values* differ between the two, because they use different ntHash libraries; the tests therefore drive both with the same injected k-mer hasher.
+> - One deliberate deviation: when `w_min > (n-1) * k`, the search window for the last few positions starts past the end of the sequence. The Go code silently reuses the previous strobe there; this crate ends iteration instead, so every reported strobe position is a real k-mer.
 
 ## Overview
 
@@ -23,6 +25,11 @@ This crate provides:
 
 - **RandStrobes (order 2/3)**  
   Choose subsequent strobes by a pseudo-random but reproducible rule derived from hash values.
+
+Sequences must consist of `A`, `C`, `G`, `T`/`U` only. The default hasher skips
+`k`-mer windows containing any other base, which would break the mapping from
+hash index to sequence position, so such sequences are rejected with
+`StrobeError::IncompleteHashValues` (as in the Go reference).
 
 ## Installation
 
@@ -54,7 +61,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     // MinStrobes order-3
-    // Two-level selection: first pick m2 in [i+w_min..i+w_max], then pick m3 in [m2+w_min..m2+w_max].
+    // Two-level selection: pick m2 in [i+w_min .. i+w_max], then m3 in
+    // [i+w_max+w_min .. i+2*w_max]. Both windows are anchored on the position of
+    // m1, not on where m2 happened to land.
     let mut min3 = MinStrobes::new(seq, 3, k, w_min, w_max)?;
     for (i, h) in min3.take(5).enumerate() {
         let [m1, m2, m3_pos] = min3.indexes();

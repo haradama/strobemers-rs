@@ -1,5 +1,11 @@
-//! Regression tests that verify the Rust implementation produces the same
-//! strobemer hash sequences as a previous snapshot (from the Go reference).
+//! Regression tests that pin the hash sequences produced by this crate.
+//!
+//! These are a snapshot of **this crate's own** output, not of the Go reference:
+//! the Go port uses `will-rowe/nthash` while this crate uses `nthash-rs`, so the
+//! underlying k-mer hash values differ numerically and the two cannot be compared
+//! directly. Agreement with the Go reference on strobe *selection* is covered by
+//! `tests/go_conformance.rs`, which drives both with the same injected hasher.
+//!
 //! If the strobemer algorithm is intentionally changed, update these expected
 //! values and document a breaking change in the CHANGELOG.
 
@@ -12,6 +18,9 @@ const W_MIN: usize = 3; // Minimum window offset
 const W_MAX: usize = 5; // Maximum window offset
 
 // ==== Snapshot of expected hash outputs (as of 2025-06-03 commit) ====
+//
+// Values are unchanged by the 2026-09-11 port-conformance fixes: those altered
+// which *position* is reported for tied window minima, never the hash itself.
 //
 // * MinStrobes order-2 … 11 values
 // * MinStrobes order-3 … 6 values
