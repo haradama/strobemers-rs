@@ -15,7 +15,12 @@ use crate::constants::{COMPL_BASES, SEQ_NT4_TABLE};
 /// * The smallest power of two greater than or equal to `x`.
 #[inline(always)]
 pub const fn roundup64(x: u64) -> u64 {
-    x.next_power_of_two()
+    // `next_power_of_two` panics on overflow; the Go reference wraps to 0 for
+    // `x > 2^63`, which `SetPrime` then turns into `u64::MAX`. Match that.
+    match x.checked_next_power_of_two() {
+        Some(v) => v,
+        None => 0,
+    }
 }
 
 /// Returns the complementary DNA/RNA base for the given ASCII byte.
@@ -65,10 +70,12 @@ pub const fn nt4(b: u8) -> u8 {
 /// - A strobe length (`$l`) between 1 and 64
 /// - Window offsets (`$w_min`, `$w_max`) where both are > 0 and `w_min ≤ w_max`
 /// - Sequence length sufficient to accommodate `(n - 1)` windows of size `(w_max + 1)`
+/// - Sequence length of at least `l`, so that one strobe fits
 ///
 /// Returns the corresponding `StrobeError` on any validation failure:
 /// - `InvalidSequence` if the sequence is empty
-/// - `OrderNotSupported` if `n` is not 2 or 3
+/// - `InvalidOrder` if `n < 2`
+/// - `OrderNotSupported` if `n > 3`
 /// - `StrobeLengthTooSmall` if `l` is outside [1..=64]
 /// - `InvalidWindowOffsets` if `w_min` or `w_max` are zero or `w_min > w_max`
 /// - `SequenceTooShort` if `seq.len()` is too small for the given parameters
@@ -84,8 +91,12 @@ macro_rules! validate_params {
         if $seq.is_empty() || !$seq.is_ascii() {
             return Err(StrobeError::InvalidSequence);
         }
-        // Order must be exactly 2 or 3
-        if !matches!($n, 2 | 3) {
+        // Order must be exactly 2 or 3. The two failure modes are kept distinct,
+        // matching the Go reference (ErrInvalidOrder vs ErrOrderNotSupported).
+        if $n < 2 {
+            return Err(StrobeError::InvalidOrder);
+        }
+        if $n > 3 {
             return Err(StrobeError::OrderNotSupported);
         }
         // Strobe length must be between 1 and 64 inclusive
@@ -96,8 +107,10 @@ macro_rules! validate_params {
         if $w_min == 0 || $w_max == 0 || $w_min > $w_max {
             return Err(StrobeError::InvalidWindowOffsets);
         }
-        // Sequence must be long enough to fit (n − 1) windows of size (w_max + 1)
-        if $seq.len() < ($n as usize - 1) * ($w_max + 1) {
+        // Sequence must be long enough to fit (n − 1) windows of size (w_max + 1),
+        // and to hold at least one strobe. The latter guarantees that
+        // `seq.len() - l` (the index of the last l-mer) cannot underflow.
+        if $seq.len() < ($n as usize - 1) * ($w_max + 1) || $seq.len() < $l {
             return Err(StrobeError::SequenceTooShort);
         }
     }};

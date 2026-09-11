@@ -1,7 +1,7 @@
 use crate::{
     Result, StrobeError,
     constants::DEFAULT_PRIME_NUMBER,
-    hashes::{KmerHasher, NtHash64, compute_min_hashes},
+    hashes::{KmerHasher, NtHash64, check_hash_count, compute_min_hashes},
     util::roundup64,
 };
 
@@ -24,8 +24,12 @@ pub struct MinStrobes {
     minval: Vec<u64>,   // Minimum hash value within each sliding window
 
     // Iteration state
-    idx: usize,      // Current index of the first k-mer (m1)
-    end_idx: usize,  // Last index at which a complete strobemer can start
+    idx: usize, // Current index of the first k-mer (m1)
+    // Last index at which a complete strobemer can start, or `None` when the
+    // sequence cannot hold `n` strobes at all. The Go reference stores this in a
+    // signed `int` and lets it go negative; `usize` would wrap, so the
+    // "no strobemer fits" case is modelled explicitly.
+    end_idx: Option<usize>,
     end_hash: usize, // Last index in `hashes` (i.e., sequence length minus k)
 
     // Strobe indices for current item
@@ -125,6 +129,9 @@ impl MinStrobes {
 
         // Compute k-mer hash values via user-supplied hasher
         let hashes = hasher.hash_all(seq, k)?;
+        // The iterator indexes `hashes` by sequence position, so the hasher must
+        // have produced exactly one value per k-mer.
+        check_hash_count(&hashes, seq.len(), k)?;
 
         // Precompute min-hash locations and values within each sliding window
         let (minloc, minval) = compute_min_hashes(&hashes, w_max - w_min + 1);
@@ -132,7 +139,9 @@ impl MinStrobes {
         // Define range bounds for m1 (starting point of each strobemer)
         let seq_len = seq.len();
         let end_hash = seq_len - k;
-        let end_idx = seq_len - k - (n as usize - 1) * k;
+        // `None` when the sequence is shorter than `n * k`, in which case the
+        // iterator yields nothing.
+        let end_idx = seq_len.checked_sub(k + (n as usize - 1) * k);
 
         Ok(Self {
             n,
@@ -171,8 +180,10 @@ impl MinStrobes {
         if q < 256 {
             return Err(StrobeError::PrimeNumberTooSmall);
         }
-        // Round up to next power of two, subtract one → Mersenne prime form
-        self.prime = roundup64(q) - 1;
+        // Round up to next power of two, subtract one → Mersenne prime form.
+        // `roundup64` wraps to 0 for `q > 2^63`, which the reference turns into
+        // an all-ones mask, so subtract with wrap-around.
+        self.prime = roundup64(q).wrapping_sub(1);
         Ok(())
     }
 
@@ -201,7 +212,7 @@ impl MinStrobes {
     /// Computes the next hash value for an order-2 MinStrobe.
     fn next_order2(&mut self) -> Option<u64> {
         // Stop if no more valid starting positions for m1
-        if self.idx > self.end_idx {
+        if self.idx > self.end_idx? {
             return None;
         }
 
@@ -226,7 +237,13 @@ impl MinStrobes {
             // Combine h1 and precomputed minimum hash
             self.h2 = (self.h1 >> 1) + self.minval[w_end] / 3;
         } else {
-            // Partial window: manually scan to find minimum
+            // Partial window: manually scan to find minimum.
+            // An empty window (`w_start > w_end`, possible once `w_min > (n-1) * k`)
+            // ends iteration; `w_start` only grows, so no later index can succeed.
+            // The Go reference instead silently reuses the previous `idx2`.
+            if w_start > w_end {
+                return None;
+            }
             let (mut best_hash, mut best_pos) = (u64::MAX, w_start);
             for pos in w_start..=w_end {
                 let cand = self.hashes[pos];
@@ -252,7 +269,7 @@ impl MinStrobes {
     ///
     fn next_order3(&mut self) -> Option<u64> {
         // Stop if no more valid starting positions for m1
-        if self.idx > self.end_idx {
+        if self.idx > self.end_idx? {
             return None;
         }
 
@@ -289,8 +306,10 @@ impl MinStrobes {
             // Partial second window near the end: manual scan
             let (mut best_hash, mut best_pos) = (u64::MAX, w2_start);
             for pos in w2_start..=w2_end {
-                // Combine current h2 with candidate hash, then mask with prime
-                let cand = (self.h2 + self.hashes[pos]) & self.prime;
+                // Combine current h2 with candidate hash, then mask with prime.
+                // `h2` is unreduced here, so the sum can exceed `u64::MAX`; the Go
+                // reference relies on uint64 wrap-around, hence `wrapping_add`.
+                let cand = self.h2.wrapping_add(self.hashes[pos]) & self.prime;
                 if cand < best_hash {
                     best_hash = cand;
                     best_pos = pos;

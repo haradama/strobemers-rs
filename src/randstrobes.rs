@@ -1,7 +1,7 @@
 use crate::{
     Result, StrobeError,
     constants::DEFAULT_PRIME_NUMBER,
-    hashes::{KmerHasher, NtHash64},
+    hashes::{KmerHasher, NtHash64, check_hash_count},
     util::roundup64,
 };
 
@@ -23,8 +23,12 @@ pub struct RandStrobes {
     hashes: Vec<u64>, // Hash values for each k-mer in the sequence
 
     // Iteration state
-    idx: usize,      // Current index of the first k-mer (m1)
-    end_idx: usize,  // Last index at which a complete strobemer can start
+    idx: usize, // Current index of the first k-mer (m1)
+    // Last index at which a complete strobemer can start, or `None` when the
+    // sequence cannot hold `n` strobes at all. The Go reference stores this in a
+    // signed `int` and lets it go negative; `usize` would wrap, so the
+    // "no strobemer fits" case is modelled explicitly.
+    end_idx: Option<usize>,
     end_hash: usize, // Last index in `hashes` (i.e., sequence length minus k)
 
     // Strobe indices for current item
@@ -133,10 +137,15 @@ impl RandStrobes {
 
         // Precompute hash values for all valid k-mers
         let hashes = hasher.hash_all(seq, k)?;
+        // The iterators index `hashes` by sequence position, so the hasher must
+        // have produced exactly one value per k-mer.
+        check_hash_count(&hashes, seq.len(), k)?;
 
         // Calculate the valid iteration bounds
-        let end_hash = seq.len().saturating_sub(k); // maximum hash index
-        let end_idx = seq.len().saturating_sub(k + (n as usize - 1) * k); // max starting index for m₁
+        let end_hash = seq.len() - k; // maximum hash index
+        // Max starting index for m₁; `None` when the sequence is shorter than
+        // `n * k`, in which case the iterator yields nothing.
+        let end_idx = seq.len().checked_sub(k + (n as usize - 1) * k);
 
         Ok(Self {
             n,
@@ -175,8 +184,10 @@ impl RandStrobes {
         if q < 256 {
             return Err(StrobeError::PrimeNumberTooSmall);
         }
-        // Round up to next power of two, subtract one → Mersenne prime form
-        self.prime = roundup64(q) - 1;
+        // Round up to next power of two, subtract one → Mersenne prime form.
+        // `roundup64` wraps to 0 for `q > 2^63`, which the reference turns into
+        // an all-ones mask, so subtract with wrap-around.
+        self.prime = roundup64(q).wrapping_sub(1);
         Ok(())
     }
 
@@ -202,21 +213,31 @@ impl RandStrobes {
         [self.index().unwrap_or(0), self.idx2, self.idx3]
     }
 
-    /// Chooses the position within `range` that minimizes `(base_hash + hashes[pos]) & prime`.
+    /// Chooses the position within `start..=end` that minimizes
+    /// `(base_hash + hashes[pos]) & prime`.
     ///
     /// # Arguments
     ///
-    /// * `base_hash` – The hash value of the previous strobe (m1 or m2).
-    /// * `range` – Inclusive range of indices to consider for the next strobe.
+    /// * `base` – The hash value of the previous strobe (m1 or m2).
+    /// * `start`, `end` – Inclusive range of indices to consider for the next strobe.
     ///
     /// # Returns
     ///
-    /// *(best_pos, best_val)* – Index of the chosen k-mer and the resulting combined hash value.
+    /// * `Some((best_pos, best_val))` – Index of the chosen k-mer and the resulting
+    ///   combined hash value.
+    /// * `None` – The range is empty (`start > end`), which happens near the end of
+    ///   the sequence once `idx + w_min` passes the last k-mer. The Go reference
+    ///   silently reuses the previous `idx2` here; returning `None` ends iteration
+    ///   instead of emitting a strobe whose second position does not exist.
     ///
     #[inline(always)]
-    fn choose_min(&self, base: u64, start: usize, end: usize) -> (usize, u64) {
-        let hashes  = &self.hashes;
-        let prime   = self.prime;
+    fn choose_min(&self, base: u64, start: usize, end: usize) -> Option<(usize, u64)> {
+        if start > end {
+            return None;
+        }
+
+        let hashes = &self.hashes;
+        let prime = self.prime;
 
         let mut best_pos = start;
         let mut best_val = u64::MAX;
@@ -228,7 +249,7 @@ impl RandStrobes {
                 best_pos = i;
             }
         }
-        (best_pos, best_val)
+        Some((best_pos, best_val))
     }
     // -------------------- order-specific next ---------------------------- //
 
@@ -239,7 +260,7 @@ impl RandStrobes {
     /// - `None` – When `idx > end_idx` (no more valid strobes).
     ///
     fn next_order2(&mut self) -> Option<u64> {
-        if self.idx > self.end_idx {
+        if self.idx > self.end_idx? {
             return None;
         }
 
@@ -255,8 +276,10 @@ impl RandStrobes {
 
         // Hash of the first k-mer (m1)
         self.h1 = self.hashes[self.idx];
-        // Choose m2 by minimizing `(h1 + hash[m2]) & prime`
-        let (pos2, _) = self.choose_min(self.h1, w_start, w_end);
+        // Choose m2 by minimizing `(h1 + hash[m2]) & prime`.
+        // An empty window (`w_start > w_end`, possible once `w_min > (n-1) * k`)
+        // ends iteration; `w_start` only grows, so no later index can succeed.
+        let (pos2, _) = self.choose_min(self.h1, w_start, w_end)?;
         self.idx2 = pos2;
         // Combine h1 and second k-mer’s hash
         self.h2 = (self.h1 >> 1) + self.hashes[pos2] / 3;
@@ -273,7 +296,7 @@ impl RandStrobes {
     /// - `None` – When no further strobes can be formed.
     ///
     fn next_order3(&mut self) -> Option<u64> {
-        if self.idx > self.end_idx {
+        if self.idx > self.end_idx? {
             return None;
         }
 
@@ -297,12 +320,12 @@ impl RandStrobes {
         // Compute m1 (first k-mer)
         self.h1 = self.hashes[self.idx];
         // Select m2
-        let (pos2, _) = self.choose_min(self.h1, w1_start, w1_end);
+        let (pos2, _) = self.choose_min(self.h1, w1_start, w1_end)?;
         self.idx2 = pos2;
-        self.h2 = self.h1 / 3     + (self.hashes[pos2] >> 2);
+        self.h2 = self.h1 / 3 + (self.hashes[pos2] >> 2);
 
         // Select m3
-        let (pos3, _) = self.choose_min(self.h2, w2_start, w2_end);
+        let (pos3, _) = self.choose_min(self.h2, w2_start, w2_end)?;
         self.idx3 = pos3;
         self.h3 = self.h2 + self.hashes[pos3] / 5;
 
