@@ -79,7 +79,14 @@ fn bench_collect(c: &mut Criterion) {
 /// the runtime is memory traffic rather than arithmetic.
 fn bench_scaling(c: &mut Criterion) {
     let mut g = c.benchmark_group("scaling/MinStrobes-order-2");
-    for len in [10_000usize, 100_000, 1_000_000, 10_000_000] {
+    for len in [
+        10_000usize,
+        100_000,
+        200_000,
+        500_000,
+        1_000_000,
+        10_000_000,
+    ] {
         let seq = make_seq(len);
         g.throughput(Throughput::Bytes(len as u64));
         g.bench_with_input(BenchmarkId::from_parameter(len), &seq, |b, seq| {

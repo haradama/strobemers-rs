@@ -92,17 +92,29 @@ fn main() -> anyhow::Result<()> {
 
 ## Performance notes
 
-Both iterators precompute one 64-bit hash per k-mer up front, so peak scratch
-memory is 8 bytes per base for `RandStrobes` and 24 for `MinStrobes`. On a
-1 Mbp sequence with `k = 31, w_min = 20, w_max = 50` a full pass costs roughly
-24 ms for `MinStrobes` and 31–55 ms for `RandStrobes` (Xeon Platinum 8480+).
+Both iterators precompute one 64-bit hash per k-mer up front, so scratch memory
+is 8 bytes per base. `MinStrobes` also needs the minimum of a sliding window: it
+precomputes that as a table — another 16 bytes per base — while the table stays
+cache-resident, and computes it online for longer sequences, keeping only
+`O(w_max)` entries. Scratch for a 20 Mbp sequence is therefore 152 MiB rather
+than 457 MiB, and per-base throughput stops degrading as the sequence grows.
+
+Measured with `cargo bench` on a Xeon Platinum 8480+ over 1 Mbp of random DNA,
+`k = 31, w_min = 20, w_max = 50`:
+
+| | default target | `-C target-cpu=native` |
+|---|---|---|
+| `MinStrobes` order 2 | 25.9 ms | 26.4 ms |
+| `MinStrobes` order 3 | 30.1 ms | 30.6 ms |
+| `RandStrobes` order 2 | 30.8 ms | 21.1 ms |
+| `RandStrobes` order 3 | 55.1 ms | 39.4 ms |
 
 `RandStrobes` picks its next strobe by minimising `(h1 + h2) & prime` over the
 window. With the default prime that reduces to a branchless 64-bit `min`, which
 vectorises into `vpminuq` when the target has AVX-512 — building with
 `RUSTFLAGS="-C target-cpu=native"` (or `-C target-cpu=x86-64-v4`) is worth about
-another 1.4x there. `MinStrobes` is unaffected, being bound by memory traffic
-rather than by that loop.
+1.4x there. `MinStrobes` is unaffected, being bound by memory traffic rather
+than by that loop.
 
 Both iterators are [`ExactSizeIterator`], so `collect()` allocates exactly once.
 

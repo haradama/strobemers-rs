@@ -1,9 +1,66 @@
 use crate::{
     Result, StrobeError,
     constants::DEFAULT_PRIME_NUMBER,
-    hashes::{KmerHasher, NtHash64, check_hash_count, compute_min_hashes},
+    hashes::{KmerHasher, MinWindow, NtHash64, check_hash_count, compute_min_hashes},
     util::{last_start_index, roundup64},
 };
+
+/// Largest sliding-window-minima table this module will precompute, in bytes.
+///
+/// The table is a `usize` and a `u64` per k-mer, so 16 bytes per base on top of
+/// the hash array itself. Below this the bulk loop that fills it is the faster
+/// way to get the minima; above it the extra memory traffic costs more than
+/// recomputing them as the iterator advances.
+///
+/// The threshold sits where the two were measured to cross (Xeon Platinum 8480+,
+/// k=31, w=20..50): at 500 kbp the table still wins slightly, at 1 Mbp the online
+/// window is about 20% faster, and it stays that way as the sequence grows.
+const MAX_MINIMA_TABLE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bytes of table per k-mer: one `usize` location plus one `u64` value.
+const MINIMA_BYTES_PER_KMER: usize = size_of::<usize>() + size_of::<u64>();
+
+/// Where the sliding-window minima come from.
+///
+/// Both variants answer the same question — the minimum of the window ending at
+/// a given position — and produce identical results; they differ only in whether
+/// the answers are materialised up front.
+#[derive(Debug, Clone)]
+enum Minima {
+    /// Precomputed for both series. Fastest while the arrays stay cache-resident.
+    Table { loc: Vec<usize>, val: Vec<u64> },
+    /// Computed as the iterator advances, keeping `O(w_max)` entries instead of
+    /// one pair per k-mer. About 20% faster once the table would no longer fit
+    /// in cache, and it removes 16 bytes per base of peak memory.
+    Online(MinWindow),
+}
+
+impl Minima {
+    /// Chooses a strategy for a sequence with `hashes.len()` k-mers.
+    ///
+    /// `lag` is how far behind the most recent position the caller may still
+    /// read; order 3 needs `w_max`, order 2 needs none.
+    fn new(hashes: &[u64], window: usize, lag: usize) -> Self {
+        if hashes.len().saturating_mul(MINIMA_BYTES_PER_KMER) <= MAX_MINIMA_TABLE_BYTES {
+            let (loc, val) = compute_min_hashes(hashes, window);
+            Self::Table { loc, val }
+        } else {
+            Self::Online(MinWindow::new(window, lag))
+        }
+    }
+
+    /// `(position, value)` of the minimum over the window ending at `p`.
+    ///
+    /// For the online variant `p` must not go backwards by more than `lag`
+    /// between calls, which both call sites respect.
+    #[inline]
+    fn at(&mut self, hashes: &[u64], p: usize) -> (usize, u64) {
+        match self {
+            Self::Table { loc, val } => (loc[p], val[p]),
+            Self::Online(win) => win.advance_to(hashes, p),
+        }
+    }
+}
 
 /// Iterator for generating MinStrobes of order 2 or 3 from a DNA/RNA sequence.
 ///
@@ -19,9 +76,9 @@ pub struct MinStrobes {
     w_max: usize, // Maximum window offset
 
     // Precomputed data
-    hashes: Vec<u64>,   // Hash values for each k-mer in the sequence
-    minloc: Vec<usize>, // Location of the minimum hash within each sliding window
-    minval: Vec<u64>,   // Minimum hash value within each sliding window
+    hashes: Vec<u64>, // Hash values for each k-mer in the sequence
+
+    minima: Minima, // Sliding-window minima, precomputed or computed online
 
     // Iteration state
     idx: usize, // Current index of the first k-mer (m1)
@@ -133,8 +190,11 @@ impl MinStrobes {
         // have produced exactly one value per k-mer.
         check_hash_count(&hashes, seq.len(), k)?;
 
-        // Precompute min-hash locations and values within each sliding window
-        let (minloc, minval) = compute_min_hashes(&hashes, w_max - w_min + 1);
+        // Window width shared by both strobe selections. Order 3 reads the
+        // minima at two positions `w_max` apart; order 2 only ever reads the
+        // position it just reached.
+        let window = w_max - w_min + 1;
+        let minima = Minima::new(&hashes, window, if n == 3 { w_max } else { 0 });
 
         // Define range bounds for m1 (starting point of each strobemer)
         let seq_len = seq.len();
@@ -148,8 +208,7 @@ impl MinStrobes {
             w_min,
             w_max,
             hashes,
-            minloc,
-            minval,
+            minima,
             idx: 0,
             end_hash,
             end_idx,
@@ -244,11 +303,14 @@ impl MinStrobes {
             w_end = self.end_hash;
         }
 
-        // If full window fits, use precomputed minimum
+        // If the full window fits, take the running minimum. Once the window
+        // starts being clamped it stays clamped, so `win_m2` is never needed
+        // again and leaving it behind is safe.
         if w_end == self.idx + self.w_max {
-            self.idx2 = self.minloc[w_end];
-            // Combine h1 and precomputed minimum hash
-            self.h2 = (self.h1 >> 1) + self.minval[w_end] / 3;
+            let (loc, val) = self.minima.at(&self.hashes, w_end);
+            self.idx2 = loc;
+            // Combine h1 and the window minimum
+            self.h2 = (self.h1 >> 1) + val / 3;
         } else {
             // Partial window: manually scan to find minimum.
             // An empty window (`w_start > w_end`, possible once `w_min > (n-1) * k`)
@@ -306,15 +368,17 @@ impl MinStrobes {
 
         // Compute m1 (first k-mer)
         self.h1 = self.hashes[self.idx];
-        // Select m2 using precomputed minima at window end
-        self.idx2 = self.minloc[w_end];
-        self.h2 = self.h1 / 3 + (self.minval[w_end] >> 2);
+        // Select m2 from the running minimum at the window end
+        let (loc2, val2) = self.minima.at(&self.hashes, w_end);
+        self.idx2 = loc2;
+        self.h2 = self.h1 / 3 + (val2 >> 2);
 
         // Select m3
         if w2_end == self.idx + (self.w_max << 1) {
-            // Full second window fits: use precomputed minima
-            self.idx3 = self.minloc[w2_end];
-            self.h3 = self.h2 + self.minval[w2_end] / 5;
+            // Full second window fits: take the running minimum
+            let (loc3, val3) = self.minima.at(&self.hashes, w2_end);
+            self.idx3 = loc3;
+            self.h3 = self.h2 + val3 / 5;
         } else {
             // Partial second window near the end: manual scan
             let (mut best_hash, mut best_pos) = (u64::MAX, w2_start);
@@ -374,6 +438,69 @@ mod tests {
         let mut ms = MinStrobes::new("ACGTACGTACGT".as_bytes(), 2, 3, 1, 4).unwrap();
         // Expect at least one strobemer
         assert!(ms.next().is_some());
+    }
+
+    /// Deterministic pseudo-random DNA, long enough to cross
+    /// `MAX_MINIMA_TABLE_BYTES` so that `Minima::new` picks the online strategy.
+    fn long_seq(n: usize) -> Vec<u8> {
+        let mut state: u64 = 0x2545F491_4F6CDD1D;
+        const BASES: [u8; 4] = *b"ACGT";
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                BASES[(state >> 33) as usize & 3]
+            })
+            .collect()
+    }
+
+    /// The precomputed table and the online window must be interchangeable.
+    ///
+    /// Every other test in the crate uses short sequences and so only exercises
+    /// the table; this one runs a sequence past the threshold both ways and
+    /// compares the full output, strobe positions included.
+    #[test]
+    fn minima_strategies_agree() {
+        let (k, w_min, w_max) = (21usize, 10usize, 25usize);
+        // Just past the point where `Minima::new` stops building a table.
+        let seq = long_seq(MAX_MINIMA_TABLE_BYTES / MINIMA_BYTES_PER_KMER + k + 1);
+
+        for n in [2u8, 3] {
+            let mut online = MinStrobes::new(&seq, n, k, w_min, w_max).unwrap();
+            assert!(
+                matches!(online.minima, Minima::Online(_)),
+                "expected the online strategy for a {}-base sequence",
+                seq.len()
+            );
+
+            // Same iterator, but with the minima materialised instead.
+            let mut table = MinStrobes::new(&seq, n, k, w_min, w_max).unwrap();
+            let (loc, val) = compute_min_hashes(&table.hashes, w_max - w_min + 1);
+            table.minima = Minima::Table { loc, val };
+
+            let mut a = Vec::new();
+            while let Some(h) = online.next() {
+                a.push((online.indexes(), h));
+            }
+            let mut b = Vec::new();
+            while let Some(h) = table.next() {
+                b.push((table.indexes(), h));
+            }
+
+            assert!(!a.is_empty(), "expected output for order {n}");
+            assert_eq!(a, b, "strategies disagree for order {n}");
+        }
+    }
+
+    /// The strategy is chosen purely by how large the table would be.
+    #[test]
+    fn strategy_switches_on_table_size() {
+        let cutoff = MAX_MINIMA_TABLE_BYTES / MINIMA_BYTES_PER_KMER;
+        let small = vec![0u64; cutoff];
+        let large = vec![0u64; cutoff + 1];
+        assert!(matches!(Minima::new(&small, 4, 0), Minima::Table { .. }));
+        assert!(matches!(Minima::new(&large, 4, 0), Minima::Online(_)));
     }
 
     #[test]
