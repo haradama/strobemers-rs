@@ -2,7 +2,7 @@ use crate::{
     Result, StrobeError,
     constants::DEFAULT_PRIME_NUMBER,
     hashes::{KmerHasher, NtHash64, check_hash_count},
-    util::roundup64,
+    util::{last_start_index, roundup64},
 };
 
 /// Iterator for generating RandStrobes of order 2 or 3 from a DNA/RNA sequence.
@@ -236,20 +236,42 @@ impl RandStrobes {
             return None;
         }
 
-        let hashes = &self.hashes;
+        // Slicing once lets the bounds check be hoisted out of the loop.
+        let window = &self.hashes[start..=end];
         let prime = self.prime;
 
-        let mut best_pos = start;
-        let mut best_val = u64::MAX;
+        // Fast path: when the mask fits in 32 bits — the default prime is
+        // 2^20 - 1 — the candidate and its offset pack into a single `u64`, and
+        // the argmin collapses into a branchless `min` reduction.
+        if prime <= u32::MAX as u64 && window.len() <= u32::MAX as usize {
+            let best = packed_argmin(window, base, prime);
+            return Some((start + (best & 0xFFFF_FFFF) as usize, best >> 32));
+        }
 
-        for i in start..=end {
-            let cand = base.wrapping_add(hashes[i]) & prime;
+        // General path for a caller-supplied prime wider than 32 bits.
+        let mut best_off = 0usize;
+        let mut best_val = u64::MAX;
+        for (off, &h) in window.iter().enumerate() {
+            let cand = base.wrapping_add(h) & prime;
             if cand < best_val {
                 best_val = cand;
-                best_pos = i;
+                best_off = off;
             }
         }
-        Some((best_pos, best_val))
+        Some((start + best_off, best_val))
+    }
+
+    /// Number of strobemers this iterator can still produce. Exact — see
+    /// [`last_start_index`].
+    #[inline]
+    fn remaining(&self) -> usize {
+        let (Some(end_idx), Some(limit)) = (
+            self.end_idx,
+            last_start_index(self.n, self.shrink, self.w_min, self.w_max, self.end_hash),
+        ) else {
+            return 0;
+        };
+        (limit.min(end_idx) + 1).saturating_sub(self.idx)
     }
     // -------------------- order-specific next ---------------------------- //
 
@@ -335,8 +357,63 @@ impl RandStrobes {
     }
 }
 
+/// Returns `(masked_candidate << 32) | offset` for the best position in `window`,
+/// where `masked_candidate` is `(base + window[offset]) & prime`.
+///
+/// Packing the offset into the low bits turns the argmin into a plain `min`
+/// reduction and keeps the earliest position among ties — the same choice the
+/// branchy form's strict `<` makes. Callers must ensure `prime <= u32::MAX` and
+/// `window.len() <= u32::MAX`, and `window` must not be empty.
+///
+/// AVX-512 has a 64-bit unsigned SIMD minimum (`vpminuq`), so there the plain
+/// loop vectorises on its own and beats any hand-unrolling.
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+fn packed_argmin(window: &[u64], base: u64, prime: u64) -> u64 {
+    let mut best = u64::MAX;
+    for (off, &h) in window.iter().enumerate() {
+        best = best.min(((base.wrapping_add(h) & prime) << 32) | off as u64);
+    }
+    best
+}
+
+/// See the AVX-512 variant above for the packing scheme.
+///
+/// Without a 64-bit SIMD minimum a single `min` chain is latency bound at about
+/// one cycle per element, so four independent accumulators are used to let the
+/// CPU overlap four reductions.
+#[cfg(not(target_feature = "avx512f"))]
+#[inline(always)]
+fn packed_argmin(window: &[u64], base: u64, prime: u64) -> u64 {
+    // `as_chunks::<4>()` (what clippy suggests here) measured ~5% slower on this
+    // loop, so the runtime-length form is kept deliberately.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
+    let mut chunks = window.chunks_exact(4);
+    let mut acc = [u64::MAX; 4];
+    let mut off = 0u64;
+
+    for c in &mut chunks {
+        for (j, &h) in c.iter().enumerate() {
+            acc[j] = acc[j].min(((base.wrapping_add(h) & prime) << 32) | (off + j as u64));
+        }
+        off += 4;
+    }
+    for (j, &h) in chunks.remainder().iter().enumerate() {
+        acc[0] = acc[0].min(((base.wrapping_add(h) & prime) << 32) | (off + j as u64));
+    }
+
+    acc[0].min(acc[1]).min(acc[2]).min(acc[3])
+}
+
 impl Iterator for RandStrobes {
     type Item = u64;
+
+    /// Exact remaining length, so `collect()` allocates exactly once.
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.remaining();
+        (n, Some(n))
+    }
 
     /// Advances the iterator, returning the next strobemer hash value.
     ///
@@ -350,6 +427,9 @@ impl Iterator for RandStrobes {
         }
     }
 }
+
+/// Exact via [`Iterator::size_hint`].
+impl ExactSizeIterator for RandStrobes {}
 
 #[cfg(test)]
 mod tests {

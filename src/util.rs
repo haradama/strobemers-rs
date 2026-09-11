@@ -61,6 +61,43 @@ pub const fn nt4(b: u8) -> u8 {
     SEQ_NT4_TABLE[b as usize]
 }
 
+/// Largest `m1` index at which a strobemer iterator can still produce an item.
+///
+/// Both iterators stop at the first position whose search window runs past the
+/// last `l`-mer, and that bound only tightens as the index grows, so this makes
+/// the remaining length exact:
+///
+/// - order 2 needs `idx + w_min ≤ end_hash` when shrinking, `idx + w_max ≤ end_hash` otherwise
+/// - order 3 needs `idx + w_max + w_min ≤ end_hash` when shrinking, `idx + 2·w_max ≤ end_hash` otherwise
+///
+/// # Arguments
+///
+/// * `n` – Strobemer order (2 or 3).
+/// * `shrink` – Whether terminal windows may be shortened.
+/// * `w_min`, `w_max` – Window offsets.
+/// * `end_hash` – Index of the last `l`-mer (`seq.len() - l`).
+///
+/// # Returns
+///
+/// * `Some(idx)` – The last usable starting index.
+/// * `None` – No position qualifies, or `n` is out of range.
+#[inline]
+pub(crate) const fn last_start_index(
+    n: u8,
+    shrink: bool,
+    w_min: usize,
+    w_max: usize,
+    end_hash: usize,
+) -> Option<usize> {
+    match (n, shrink) {
+        (2, true) => end_hash.checked_sub(w_min),
+        (2, false) => end_hash.checked_sub(w_max),
+        (3, true) => end_hash.checked_sub(w_max + w_min),
+        (3, false) => end_hash.checked_sub(w_max << 1),
+        _ => None,
+    }
+}
+
 /// Validates parameters for strobemer construction and returns early on error.
 ///
 /// This macro is intended to be invoked at the start of constructors or functions

@@ -1,5 +1,5 @@
 use crate::{Result, StrobeError};
-use nthash_rs::kmer::NtHashBuilder;
+use nthash_rs::kmer::NtHash;
 
 pub trait KmerHasher: Send + Sync + 'static {
     fn hash_all(&self, seq: &[u8], k: usize) -> Result<Vec<u64>>;
@@ -21,15 +21,14 @@ impl KmerHasher for NtHash64 {
             return Err(StrobeError::SequenceTooShort);
         }
 
-        let it = NtHashBuilder::new(seq)
-            .k(k as u16)
-            .num_hashes(1)
-            .finish()
-            .map_err(StrobeError::from)?;
+        // `NtHashIter` yields `(pos, Vec<u64>)`, so iterating it heap-allocates a
+        // one-element vector per k-mer. Drive the roller directly instead and
+        // read the canonical hash out of its reusable buffer.
+        let mut roller = NtHash::new(seq, k as u16, 1, 0).map_err(StrobeError::from)?;
 
         let mut out = Vec::with_capacity(seq.len() - k + 1);
-        for (_, h) in it {
-            out.push(h[0]);
+        while roller.roll() {
+            out.push(roller.hashes()[0]);
         }
         Ok(out)
     }
@@ -89,10 +88,18 @@ pub fn compute_min_hashes(hashes: &[u64], w: usize) -> (Vec<usize>, Vec<u64>) {
     let mut head = 0usize;
     let mut len = 0usize;
 
+    // `head + len <= 2 * w` always holds, so wrapping the ring buffer never needs
+    // a division: one conditional subtraction is enough. `%` compiles to a real
+    // `div` whenever `w` is not a power of two, and it sits in the inner loop.
+    #[inline(always)]
+    fn wrap(x: usize, w: usize) -> usize {
+        if x >= w { x - w } else { x }
+    }
+
     for (i, &h) in hashes.iter().enumerate() {
         let window_start = i.saturating_sub(w - 1);
         while len > 0 && idx_q[head] < window_start {
-            head = (head + 1) % w;
+            head = wrap(head + 1, w);
             len -= 1;
         }
 
@@ -100,11 +107,11 @@ pub fn compute_min_hashes(hashes: &[u64], w: usize) -> (Vec<usize>, Vec<u64>) {
         // deque holds the *earliest* position among ties. The Go reference keeps
         // a sorted buffer that inserts after equal elements, giving the same
         // choice; using `>=` here would report the latest position instead.
-        while len > 0 && val_q[(head + len - 1) % w] > h {
+        while len > 0 && val_q[wrap(head + len - 1, w)] > h {
             len -= 1;
         }
 
-        let tail = (head + len) % w;
+        let tail = wrap(head + len, w);
         idx_q[tail] = i;
         val_q[tail] = h;
         len += 1;

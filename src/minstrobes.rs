@@ -2,7 +2,7 @@ use crate::{
     Result, StrobeError,
     constants::DEFAULT_PRIME_NUMBER,
     hashes::{KmerHasher, NtHash64, check_hash_count, compute_min_hashes},
-    util::roundup64,
+    util::{last_start_index, roundup64},
 };
 
 /// Iterator for generating MinStrobes of order 2 or 3 from a DNA/RNA sequence.
@@ -209,6 +209,19 @@ impl MinStrobes {
         [self.index().unwrap_or(0), self.idx2, self.idx3]
     }
 
+    /// Number of strobemers this iterator can still produce. Exact — see
+    /// [`last_start_index`].
+    #[inline]
+    fn remaining(&self) -> usize {
+        let (Some(end_idx), Some(limit)) = (
+            self.end_idx,
+            last_start_index(self.n, self.shrink, self.w_min, self.w_max, self.end_hash),
+        ) else {
+            return 0;
+        };
+        (limit.min(end_idx) + 1).saturating_sub(self.idx)
+    }
+
     /// Computes the next hash value for an order-2 MinStrobe.
     fn next_order2(&mut self) -> Option<u64> {
         // Stop if no more valid starting positions for m1
@@ -328,6 +341,13 @@ impl MinStrobes {
 impl Iterator for MinStrobes {
     type Item = u64;
 
+    /// Exact remaining length, so `collect()` allocates exactly once.
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.remaining();
+        (n, Some(n))
+    }
+
     /// Advances the iterator, returning the next strobemer hash value.
     ///
     /// Dispatches to `next_order2` or `next_order3` based on `self.n`.
@@ -340,6 +360,9 @@ impl Iterator for MinStrobes {
         }
     }
 }
+
+/// Exact via [`Iterator::size_hint`].
+impl ExactSizeIterator for MinStrobes {}
 
 #[cfg(test)]
 mod tests {
