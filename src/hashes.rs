@@ -1,36 +1,201 @@
-use crate::{Result, StrobeError};
+use crate::{Result, StrobeError, util::is_supported_base};
 use nthash_rs::kmer::NtHash;
 
-pub trait KmerHasher: Send + Sync + 'static {
+/// Source of k-mer hashes for [`MinStrobes`](crate::MinStrobes) and
+/// [`RandStrobes`](crate::RandStrobes).
+///
+/// Implement this to replace the default ntHash-based [`NtHash64`], and pass
+/// the implementation to `with_hasher`.
+pub trait KmerHasher {
+    /// Hashes every `k`-mer of `seq`, in order.
+    ///
+    /// Must return exactly `seq.len() - k + 1` values, where element `i` is the
+    /// hash of `seq[i..i + k]`; the iterators use the index as the k-mer's
+    /// position, and reject any other length with
+    /// [`StrobeError::IncompleteHashValues`].
+    ///
+    /// The constructors only call this with a non-empty ASCII `seq` and
+    /// `1 <= k <= min(64, seq.len())`.
     fn hash_all(&self, seq: &[u8], k: usize) -> Result<Vec<u64>>;
 }
 
+/// The default [`KmerHasher`]: canonical 64-bit ntHash, via `nthash-rs`.
+///
+/// Accepts `A`, `C`, `G` and `T` in either case. Any other base — including
+/// `U`, so RNA must be converted first — makes
+/// [`hash_all`](KmerHasher::hash_all) fail with
+/// [`StrobeError::UnsupportedBase`]; see [`acgt_runs`](crate::acgt_runs).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NtHash64;
-impl Default for NtHash64 {
-    fn default() -> Self {
-        Self
+
+/// The error for the first base of `seq` that ntHash cannot hash, if any.
+pub(crate) fn unsupported_base(seq: &[u8]) -> Option<StrobeError> {
+    // Checking a block at a time without an early exit lets the common,
+    // all-valid case vectorise; the position is only looked up on failure.
+    if seq
+        .chunks(4096)
+        .all(|block| block.iter().fold(true, |ok, &b| ok & is_supported_base(b)))
+    {
+        return None;
     }
+    seq.iter()
+        .position(|&b| !is_supported_base(b))
+        .map(|position| StrobeError::UnsupportedBase {
+            position,
+            byte: seq[position],
+        })
+}
+
+/// Appends the canonical ntHash of every `k`-mer of `seq` to `out`.
+///
+/// `seq` must hold at least one `k`-mer and `k` must be in `1..=64`.
+fn nthash_into(seq: &[u8], k: usize, out: &mut Vec<u64>) -> Result<()> {
+    let expected = seq.len() - k + 1;
+    let before = out.len();
+    out.reserve(expected);
+
+    // `NtHashIter` yields `(pos, Vec<u64>)`, so iterating it heap-allocates a
+    // one-element vector per k-mer. Drive the roller directly instead and
+    // read the canonical hash out of its reusable buffer.
+    let mut roller = match NtHash::new(seq, k as u16, 1, 0) {
+        Ok(roller) => roller,
+        Err(e) => return Err(unsupported_base(seq).unwrap_or_else(|| e.into())),
+    };
+    while roller.roll() {
+        out.push(roller.hashes()[0]);
+    }
+
+    // `nthash-rs` skips every window containing a base it has no seed for,
+    // which leaves fewer hashes than k-mers. Name the culprit rather than
+    // letting the caller see a bare length mismatch.
+    if out.len() - before != expected {
+        return Err(unsupported_base(seq).unwrap_or(StrobeError::IncompleteHashValues));
+    }
+    Ok(())
 }
 
 impl KmerHasher for NtHash64 {
     fn hash_all(&self, seq: &[u8], k: usize) -> Result<Vec<u64>> {
         if !(1..=64).contains(&k) {
-            return Err(StrobeError::StrobeLengthTooSmall);
+            return Err(StrobeError::InvalidStrobeLength);
         }
         if seq.len() < k {
             return Err(StrobeError::SequenceTooShort);
         }
-
-        // `NtHashIter` yields `(pos, Vec<u64>)`, so iterating it heap-allocates a
-        // one-element vector per k-mer. Drive the roller directly instead and
-        // read the canonical hash out of its reusable buffer.
-        let mut roller = NtHash::new(seq, k as u16, 1, 0).map_err(StrobeError::from)?;
-
-        let mut out = Vec::with_capacity(seq.len() - k + 1);
-        while roller.roll() {
-            out.push(roller.hashes()[0]);
-        }
+        let mut out = Vec::new();
+        nthash_into(seq, k, &mut out)?;
         Ok(out)
+    }
+}
+
+/// How many k-mers to hash ahead of the iterator at a time.
+///
+/// Large enough that sliding the buffer forward is rare and the hashing loop
+/// runs in long stretches; small enough that the buffer stays cache-resident.
+/// The `scaling` benchmark group shows the effect, so re-run it before changing
+/// this value.
+pub(crate) const CHUNK_KMERS: usize = 1 << 14;
+
+/// The k-mer hashes an iterator can currently see.
+///
+/// The iterators only ever look a bounded distance ahead of their position, so
+/// the hashes do not all have to exist at once. This holds a contiguous run of
+/// them, `buf[i]` being the hash of the k-mer at `base + i`, and — when built
+/// with [`HashBuf::streaming`] — hashes the next stretch of the sequence as the
+/// iterator approaches the end of the run.
+///
+/// Keeping the run contiguous, rather than a ring, lets the callers slice their
+/// search windows directly; refilling in bulk keeps the hashing loop tight.
+#[derive(Debug, Clone)]
+pub(crate) struct HashBuf<'a> {
+    buf: Vec<u64>,
+    /// Position of the k-mer `buf[0]` belongs to.
+    base: usize,
+    /// Most k-mers ever held at once.
+    cap: usize,
+    /// Number of k-mers in the whole sequence.
+    total: usize,
+    /// The sequence still to be hashed from; unused once `buf` reaches the end.
+    seq: &'a [u8],
+    k: usize,
+}
+
+impl HashBuf<'static> {
+    /// Wraps hashes that already cover the whole sequence.
+    pub(crate) fn complete(hashes: Vec<u64>) -> Self {
+        Self {
+            base: 0,
+            cap: hashes.len(),
+            total: hashes.len(),
+            buf: hashes,
+            seq: &[],
+            k: 0,
+        }
+    }
+}
+
+impl<'a> HashBuf<'a> {
+    /// Hashes `seq` with ntHash on demand.
+    ///
+    /// `lookahead` is the furthest a caller reads past the position it passes
+    /// to [`ensure`](Self::ensure); `chunk` is how many further k-mers to hash
+    /// per refill. `seq` must be at least `k` long and contain only bases
+    /// ntHash supports, which is what makes the later refills infallible.
+    pub(crate) fn streaming(
+        seq: &'a [u8],
+        k: usize,
+        lookahead: usize,
+        chunk: usize,
+    ) -> Result<Self> {
+        let total = seq.len() - k + 1;
+        let cap = total.min(lookahead.saturating_add(chunk).saturating_add(1));
+        let mut buf = Vec::new();
+        nthash_into(&seq[..cap + k - 1], k, &mut buf)?;
+        Ok(Self {
+            buf,
+            base: 0,
+            cap,
+            total,
+            seq,
+            k,
+        })
+    }
+
+    /// Whether every k-mer of the sequence is in the buffer.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.buf.len() == self.total
+    }
+
+    /// The buffered hashes and the position of the first one.
+    #[inline(always)]
+    pub(crate) fn view(&self) -> (&[u64], usize) {
+        (&self.buf, self.base)
+    }
+
+    /// Makes positions `idx..=hi` available, discarding everything before
+    /// `idx`. Requires `hi - idx <= lookahead`, and `idx` must not decrease.
+    #[inline(always)]
+    pub(crate) fn ensure(&mut self, idx: usize, hi: usize) {
+        if hi - self.base >= self.buf.len() {
+            self.refill(idx);
+        }
+    }
+
+    /// Moves the run forward so that it starts at `idx`.
+    #[cold]
+    #[inline(never)]
+    fn refill(&mut self, idx: usize) {
+        let keep_from = idx - self.base;
+        self.buf.copy_within(keep_from.., 0);
+        self.buf.truncate(self.buf.len() - keep_from);
+        self.base = idx;
+
+        let from = idx + self.buf.len();
+        let to = self.total.min(idx + self.cap);
+        if from < to {
+            nthash_into(&self.seq[from..to + self.k - 1], self.k, &mut self.buf)
+                .expect("the sequence was validated when the iterator was built");
+        }
     }
 }
 
@@ -38,8 +203,9 @@ impl KmerHasher for NtHash64 {
 ///
 /// Both strobemer iterators treat the index into the hash vector as the position
 /// of the corresponding `k`-mer in the sequence. `nthash-rs` **skips** windows
-/// containing `N` (or any non-ACGT byte), which silently breaks that mapping and
-/// would lead to out-of-range strobe positions, so the length is checked here.
+/// containing `N` (or any non-ACGT byte) — [`NtHash64`] reports that itself — and
+/// a custom hasher may do the same, which silently breaks that mapping and would
+/// lead to out-of-range strobe positions, so the length is checked here.
 /// The Go reference performs the same check and reports `ErrIncompleteHashValues`.
 ///
 /// # Parameters
@@ -51,7 +217,7 @@ impl KmerHasher for NtHash64 {
 /// `Ok(())` when `hashes.len() == seq_len - k + 1`, otherwise
 /// [`StrobeError::IncompleteHashValues`].
 pub(crate) fn check_hash_count(hashes: &[u64], seq_len: usize, k: usize) -> Result<()> {
-    // `validate_params!` guarantees `seq_len >= k`, so this cannot underflow.
+    // `validate_params` guarantees `seq_len >= k`, so this cannot underflow.
     if hashes.len() != seq_len - k + 1 {
         return Err(StrobeError::IncompleteHashValues);
     }
@@ -152,15 +318,16 @@ impl MinWindow {
     /// Absorbs every position up to and including `p`, then reports the minimum
     /// of the window ending at `p`.
     ///
-    /// `p` must not go backwards by more than `lag` between calls, and
-    /// `hashes[..=p]` must be valid.
+    /// `buf[i]` is the hash at position `base + i`. `p` must not go backwards
+    /// by more than `lag` between calls, and every position not yet absorbed up
+    /// to `p` must lie inside `buf`.
     #[inline]
-    pub(crate) fn advance_to(&mut self, hashes: &[u64], p: usize) -> (usize, u64) {
+    pub(crate) fn advance_to(&mut self, buf: &[u64], base: usize, p: usize) -> (usize, u64) {
         // With no lag the caller only ever asks for the position just absorbed,
-        // so the history is pure overhead — one extra 16-byte store per k-mer.
+        // so the history is pure overhead — one extra store per k-mer.
         if self.hist_mask == 0 {
             while self.next_pos <= p {
-                self.push(self.next_pos, hashes[self.next_pos]);
+                self.push(self.next_pos, buf[self.next_pos - base]);
                 self.next_pos += 1;
             }
             return self.min();
@@ -168,7 +335,7 @@ impl MinWindow {
 
         while self.next_pos <= p {
             let i = self.next_pos;
-            self.push(i, hashes[i]);
+            self.push(i, buf[i - base]);
             self.hist[i & self.hist_mask] = self.min();
             self.next_pos += 1;
         }
@@ -182,8 +349,8 @@ impl MinWindow {
 /// Materialises both series. [`MinStrobes`](crate::MinStrobes) uses this for
 /// short sequences and [`MinWindow`] for long ones; the deque below is
 /// deliberately written out rather than driven through [`MinWindow`], because in
-/// a bulk pass the hot state has to live in locals — behind `&mut self` it costs
-/// about 18% here. `minima_strategies_agree` in `minstrobes` pins the two
+/// a bulk pass the hot state has to live in locals — behind `&mut self` it is
+/// measurably slower. `minima_strategies_agree` in `minstrobes` pins the two
 /// against each other.
 ///
 /// # Parameters
@@ -197,7 +364,7 @@ impl MinWindow {
 ///
 /// Only valid when `i ≥ w - 1`; for indices `< w - 1`, the values in `locs` and `mins` remain default (0 and `u64::MAX`).
 ///
-pub fn compute_min_hashes(hashes: &[u64], w: usize) -> (Vec<usize>, Vec<u64>) {
+pub(crate) fn compute_min_hashes(hashes: &[u64], w: usize) -> (Vec<usize>, Vec<u64>) {
     assert!(w >= 1, "window size must be ≥ 1");
     let n = hashes.len();
 
@@ -290,7 +457,7 @@ mod tests {
             for (offset, &want_loc) in want.iter().enumerate() {
                 let p = w - 1 + offset;
                 assert_eq!(
-                    win.advance_to(&v, p),
+                    win.advance_to(&v, 0, p),
                     (want_loc, v[want_loc]),
                     "w={w} p={p}"
                 );

@@ -7,7 +7,7 @@
 //! `tests/go_conformance.rs`, which drives both with the same injected hasher.
 //!
 //! If the strobemer algorithm is intentionally changed, update these expected
-//! values and document a breaking change in the CHANGELOG.
+//! values and release the change as a breaking one.
 
 use strobemers_rs::{MinStrobes, RandStrobes, Result};
 
@@ -17,16 +17,10 @@ const L: usize = 3; // k-mer (strobe) length
 const W_MIN: usize = 3; // Minimum window offset
 const W_MAX: usize = 5; // Maximum window offset
 
-// ==== Snapshot of expected hash outputs (as of 2025-06-03 commit) ====
+// ==== Snapshot of expected hash outputs ====
 //
-// Values are unchanged by the 2026-09-11 port-conformance fixes: those altered
-// which *position* is reported for tied window minima, never the hash itself.
-//
-// * MinStrobes order-2 … 11 values
-// * MinStrobes order-3 … 6 values
-// * RandStrobes order-2 … 11 values
-// * RandStrobes order-3 … 6 values
-//
+// Only the hashes are pinned here. Which *position* is reported for tied window
+// minima is covered by `tests/go_conformance.rs`.
 const MIN_O2: [u64; 11] = [
     5508583604130516576,
     7820137869046132365,
@@ -77,7 +71,7 @@ const RAND_O3: [u64; 6] = [
 //                         REGRESSION  TESTS
 // ---------------------------------------------------------------------
 
-/// Verifies that MinStrobes of order 2 produces exactly the expected sequence of 11 hash values.
+/// Verifies that MinStrobes of order 2 produces exactly the expected sequence of hash values.
 /// Collects all outputs from the iterator and compares them to the hard-coded snapshot.
 #[test]
 fn regression_minstrobes_order2() -> Result<()> {
@@ -88,7 +82,7 @@ fn regression_minstrobes_order2() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that MinStrobes of order 3 produces exactly the expected sequence of 6 hash values.
+/// Verifies that MinStrobes of order 3 produces exactly the expected sequence of hash values.
 /// Collects all outputs from the iterator and compares them to the hard-coded snapshot.
 #[test]
 fn regression_minstrobes_order3() -> Result<()> {
@@ -97,7 +91,7 @@ fn regression_minstrobes_order3() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that RandStrobes of order 2 produces exactly the expected sequence of 11 hash values.
+/// Verifies that RandStrobes of order 2 produces exactly the expected sequence of hash values.
 /// Collects all outputs from the iterator and compares them to the hard-coded snapshot.
 #[test]
 fn regression_randstrobes_order2() -> Result<()> {
@@ -106,7 +100,7 @@ fn regression_randstrobes_order2() -> Result<()> {
     Ok(())
 }
 
-/// Verifies that RandStrobes of order 3 produces exactly the expected sequence of 6 hash values.
+/// Verifies that RandStrobes of order 3 produces exactly the expected sequence of hash values.
 /// Collects all outputs from the iterator and compares them to the hard-coded snapshot.
 #[test]
 fn regression_randstrobes_order3() -> Result<()> {

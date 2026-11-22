@@ -1,55 +1,30 @@
 use crate::{
-    Result, StrobeError,
-    constants::DEFAULT_PRIME_NUMBER,
-    hashes::{KmerHasher, NtHash64, check_hash_count},
-    util::{last_start_index, roundup64},
+    Result,
+    hashes::{CHUNK_KMERS, HashBuf, KmerHasher, check_hash_count, unsupported_base},
+    state::{State, masked_argmin},
+    util::validate_params,
 };
 
-/// Iterator for generating RandStrobes of order 2 or 3 from a DNA/RNA sequence.
+/// Iterator for generating RandStrobes of order 2 or 3 from a DNA sequence.
 ///
 /// A RandStrobe is a strobemer that selects subsequent k-mers by choosing the
 /// position that minimizes `(base_hash + candidate_hash) & prime`. This approach
 /// provides a pseudo-random yet deterministic selection of k-mers within sliding windows.
 ///
+/// Built with [`new`](Self::new), the iterator borrows the sequence and hashes
+/// it as it goes, so its memory use does not grow with the sequence. Built with
+/// [`with_hasher`](Self::with_hasher), every k-mer is hashed up front and the
+/// iterator owns the result.
 #[derive(Debug, Clone)]
-pub struct RandStrobes {
-    // Parameters controlling strobemer generation
-    n: u8,        // Order of strobemer: 2 or 3
-    _k: usize,    // k-mer length (only needed during construction)
-    w_min: usize, // Minimum window offset
-    w_max: usize, // Maximum window offset
-
-    // Precomputed data
-    hashes: Vec<u64>, // Hash values for each k-mer in the sequence
-
-    // Iteration state
-    idx: usize, // Current index of the first k-mer (m1)
-    // Last index at which a complete strobemer can start, or `None` when the
-    // sequence cannot hold `n` strobes at all. The Go reference stores this in a
-    // signed `int` and lets it go negative; `usize` would wrap, so the
-    // "no strobemer fits" case is modelled explicitly.
-    end_idx: Option<usize>,
-    end_hash: usize, // Last index in `hashes` (i.e., sequence length minus k)
-
-    // Strobe indices for current item
-    idx2: usize, // Index of second k-mer (m2)
-    idx3: usize, // Index of third k-mer (m3) if order = 3
-
-    // Prime number and shrink-window flag
-    prime: u64, // Used for mask-based combination: `(base_hash + candidate_hash) & prime`
-    shrink: bool, // Whether to shrink windows near the end if the full window does not fit
-
-    // Working registers for hash values
-    h1: u64, // Hash of first k-mer (m1)
-    h2: u64, // Combined hash after selecting m2
-    h3: u64, // Combined hash after selecting m3 (order 3 only)
+pub struct RandStrobes<'a> {
+    state: State<'a>,
 }
 
-impl RandStrobes {
+impl<'a> RandStrobes<'a> {
     /// Constructs a new [`RandStrobes`] iterator using the default hash function (`NtHash64`).
     ///
-    /// This method serves as a convenience wrapper for [`RandStrobes::with_hasher`],
-    /// providing a standard ntHash-based setup for k-mer hashing.
+    /// The sequence is validated here, but hashed lazily while iterating, which
+    /// is why the iterator borrows it.
     ///
     /// The generated iterator will produce strobemers using the **RandStrobe protocol**,
     /// where the second (and optionally third) k-mer is selected based on a minimum
@@ -76,10 +51,34 @@ impl RandStrobes {
     ///     println!("{}", h);
     /// }
     /// ```
-    pub fn new(seq: &[u8], n: u8, k: usize, w_min: usize, w_max: usize) -> Result<Self> {
-        Self::with_hasher(seq, n, k, w_min, w_max, &NtHash64)
+    pub fn new(seq: &'a [u8], n: u8, k: usize, w_min: usize, w_max: usize) -> Result<Self> {
+        Self::with_chunk(seq, n, k, w_min, w_max, CHUNK_KMERS)
     }
 
+    /// [`new`](Self::new) with an explicit refill size, so that tests can put
+    /// buffer boundaries wherever they like.
+    fn with_chunk(
+        seq: &'a [u8],
+        n: u8,
+        k: usize,
+        w_min: usize,
+        w_max: usize,
+        chunk: usize,
+    ) -> Result<Self> {
+        validate_params(seq, n, k, w_min, w_max)?;
+        // Hashing is deferred, so anything it would trip over has to be
+        // reported now.
+        if let Some(e) = unsupported_base(seq) {
+            return Err(e);
+        }
+        let hashes = HashBuf::streaming(seq, k, (n as usize - 1) * w_max, chunk)?;
+        Ok(Self {
+            state: State::new(seq.len(), n, k, w_min, w_max, hashes),
+        })
+    }
+}
+
+impl RandStrobes<'static> {
     /// Constructs a new [`RandStrobes`] iterator using a user-defined k-mer hash function.
     ///
     /// This method enables **dependency injection** of the hashing algorithm via the [`KmerHasher`] trait.
@@ -91,9 +90,13 @@ impl RandStrobes {
     ///   to **minimize a masked combination** `(h₁ + h₂) & prime`
     /// - If `n = 3`, the third k-mer is chosen similarly after `w_max + w_min`
     ///
+    /// All k-mers are hashed before this returns, so a hasher that fails or
+    /// returns the wrong number of values is reported here, and the iterator
+    /// keeps no reference to the sequence or the hasher.
+    ///
     /// # Arguments
     ///
-    /// * `seq` – Input DNA/RNA sequence as ASCII bytes.
+    /// * `seq` – Input DNA sequence as ASCII bytes.
     /// * `n` – Order of the strobemer (must be 2 or 3).
     /// * `k` – Length of each strobe (k-mer), within the inclusive range [1, 64].
     /// * `w_min` – Minimum offset for the search window (must be ≥ 1).
@@ -130,325 +133,155 @@ impl RandStrobes {
         hasher: &H,
     ) -> Result<Self>
     where
-        H: KmerHasher,
+        H: KmerHasher + ?Sized,
     {
-        // Ensure all parameters are valid before proceeding
-        validate_params!(seq, n, k, w_min, w_max);
+        validate_params(seq, n, k, w_min, w_max)?;
 
-        // Precompute hash values for all valid k-mers
         let hashes = hasher.hash_all(seq, k)?;
-        // The iterators index `hashes` by sequence position, so the hasher must
-        // have produced exactly one value per k-mer.
+        // The iterator indexes the hashes by sequence position, so the hasher
+        // must have produced exactly one value per k-mer.
         check_hash_count(&hashes, seq.len(), k)?;
 
-        // Calculate the valid iteration bounds
-        let end_hash = seq.len() - k; // maximum hash index
-        // Max starting index for m₁; `None` when the sequence is shorter than
-        // `n * k`, in which case the iterator yields nothing.
-        let end_idx = seq.len().checked_sub(k + (n as usize - 1) * k);
-
         Ok(Self {
-            n,
-            _k: k,
-            w_min,
-            w_max,
-            hashes,
-            idx: 0,
-            end_idx,
-            end_hash,
-            idx2: 0,
-            idx3: 0,
-            prime: DEFAULT_PRIME_NUMBER,
-            shrink: true,
-            h1: 0,
-            h2: 0,
-            h3: 0,
+            state: State::new(seq.len(), n, k, w_min, w_max, HashBuf::complete(hashes)),
         })
     }
+}
 
-    /// Sets a new prime number for combining hash values.
-    ///
-    /// The formula used is `(base_hash + candidate_hash) & prime`. The provided `q` must
-    /// be at least 256. Internally, `q` is rounded up to the next power of two and then
-    /// decremented by one to form a Mersenne prime.
-    ///
-    /// # Arguments
-    ///
-    /// * `q` – Candidate prime (will be rounded to Mersenne form: `2^k − 1`).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(())` – If `q` ≥ 256, updates `self.prime`.
-    /// * `Err(StrobeError::PrimeNumberTooSmall)` – If `q` < 256.
-    pub fn set_prime(&mut self, q: u64) -> Result<()> {
-        if q < 256 {
-            return Err(StrobeError::PrimeNumberTooSmall);
+impl RandStrobes<'_> {
+    fn advance(&mut self) -> Option<u64> {
+        match self.state.n {
+            2 => self.next_order2(),
+            _ => self.next_order3(),
         }
-        // Round up to next power of two, subtract one → Mersenne prime form.
-        // `roundup64` wraps to 0 for `q > 2^63`, which the reference turns into
-        // an all-ones mask, so subtract with wrap-around.
-        self.prime = roundup64(q).wrapping_sub(1);
-        Ok(())
     }
-
-    /// Enables or disables window shrinking at the sequence end.
-    ///
-    /// When `shrink = true`, terminal windows may be smaller than `w_max`.
-    /// When `shrink = false`, iteration stops if a full window cannot be formed.
-    pub fn set_window_shrink(&mut self, s: bool) {
-        self.shrink = s;
-    }
-
-    /// Returns the index of the last returned first-strobe (m1).
-    ///
-    /// If no strobe has been generated yet, returns `None`.
-    pub fn index(&self) -> Option<usize> {
-        self.idx.checked_sub(1)
-    }
-
-    /// Returns the indices of the most recently generated strobes: [m1, m2, (m3)].
-    ///
-    /// If no strobe has been generated yet, returns `[0, 0, 0]`.
-    pub fn indexes(&self) -> [usize; 3] {
-        [self.index().unwrap_or(0), self.idx2, self.idx3]
-    }
-
-    /// Chooses the position within `start..=end` that minimizes
-    /// `(base_hash + hashes[pos]) & prime`.
-    ///
-    /// # Arguments
-    ///
-    /// * `base` – The hash value of the previous strobe (m1 or m2).
-    /// * `start`, `end` – Inclusive range of indices to consider for the next strobe.
-    ///
-    /// # Returns
-    ///
-    /// * `Some((best_pos, best_val))` – Index of the chosen k-mer and the resulting
-    ///   combined hash value.
-    /// * `None` – The range is empty (`start > end`), which happens near the end of
-    ///   the sequence once `idx + w_min` passes the last k-mer. The Go reference
-    ///   silently reuses the previous `idx2` here; returning `None` ends iteration
-    ///   instead of emitting a strobe whose second position does not exist.
-    ///
-    #[inline(always)]
-    fn choose_min(&self, base: u64, start: usize, end: usize) -> Option<(usize, u64)> {
-        if start > end {
-            return None;
-        }
-
-        // Slicing once lets the bounds check be hoisted out of the loop.
-        let window = &self.hashes[start..=end];
-        let prime = self.prime;
-
-        // Fast path: when the mask fits in 32 bits — the default prime is
-        // 2^20 - 1 — the candidate and its offset pack into a single `u64`, and
-        // the argmin collapses into a branchless `min` reduction.
-        if prime <= u32::MAX as u64 && window.len() <= u32::MAX as usize {
-            let best = packed_argmin(window, base, prime);
-            return Some((start + (best & 0xFFFF_FFFF) as usize, best >> 32));
-        }
-
-        // General path for a caller-supplied prime wider than 32 bits.
-        let mut best_off = 0usize;
-        let mut best_val = u64::MAX;
-        for (off, &h) in window.iter().enumerate() {
-            let cand = base.wrapping_add(h) & prime;
-            if cand < best_val {
-                best_val = cand;
-                best_off = off;
-            }
-        }
-        Some((start + best_off, best_val))
-    }
-
-    /// Number of strobemers this iterator can still produce. Exact — see
-    /// [`last_start_index`].
-    #[inline]
-    fn remaining(&self) -> usize {
-        let (Some(end_idx), Some(limit)) = (
-            self.end_idx,
-            last_start_index(self.n, self.shrink, self.w_min, self.w_max, self.end_hash),
-        ) else {
-            return 0;
-        };
-        (limit.min(end_idx) + 1).saturating_sub(self.idx)
-    }
-    // -------------------- order-specific next ---------------------------- //
 
     /// Computes the next RandStrobe hash value for order 2.
-    ///
-    /// # Returns
-    /// - `Some(u64)` – Combined hash of m1 and m2, if available.
-    /// - `None` – When `idx > end_idx` (no more valid strobes).
-    ///
     fn next_order2(&mut self) -> Option<u64> {
-        if self.idx > self.end_idx? {
-            return None;
-        }
+        let s = &mut self.state;
+        let hi = s.begin()?;
+        let (buf, base) = s.hashes.view();
+        // `hs[d]` is the hash of the k-mer `d` positions after m1.
+        let hs = &buf[s.idx - base..][..=hi];
 
-        // Define the search window for m2
-        let w_start = self.idx + self.w_min;
-        let mut w_end = self.idx + self.w_max;
-        if w_end > self.end_hash {
-            if !self.shrink {
-                return None;
-            }
-            w_end = self.end_hash;
-        }
-
-        // Hash of the first k-mer (m1)
-        self.h1 = self.hashes[self.idx];
+        let h1 = hs[0];
         // Choose m2 by minimizing `(h1 + hash[m2]) & prime`.
-        // An empty window (`w_start > w_end`, possible once `w_min > (n-1) * k`)
-        // ends iteration; `w_start` only grows, so no later index can succeed.
-        let (pos2, _) = self.choose_min(self.h1, w_start, w_end)?;
-        self.idx2 = pos2;
-        // Combine h1 and second k-mer’s hash
-        self.h2 = (self.h1 >> 1) + self.hashes[pos2] / 3;
+        let m2 = s.w_min + masked_argmin(&hs[s.w_min..], h1, s.prime);
+        let hash = (h1 >> 1) + hs[m2] / 3;
 
-        // Advance to next starting index for m1
-        self.idx += 1;
-        Some(self.h2)
+        s.idx2 = s.idx + m2;
+        s.idx += 1;
+        Some(hash)
     }
 
     /// Computes the next RandStrobe hash value for order 3.
     ///
-    /// # Returns
-    /// - `Some(u64)` – Combined hash of m1, m2, and m3, if available.
-    /// - `None` – When no further strobes can be formed.
-    ///
+    /// Both windows are anchored on m1: m2 comes from `w_min..=w_max` after it,
+    /// m3 from `w_max + w_min..=2 * w_max`, the latter clipped by the end of
+    /// the sequence.
     fn next_order3(&mut self) -> Option<u64> {
-        if self.idx > self.end_idx? {
-            return None;
-        }
+        let s = &mut self.state;
+        let hi = s.begin()?;
+        let (buf, base) = s.hashes.view();
+        let hs = &buf[s.idx - base..][..=hi];
 
-        // First window range for selecting m2
-        let w1_start = self.idx + self.w_min;
-        let w1_end = self.idx + self.w_max;
+        let h1 = hs[0];
+        let m2 = s.w_min + masked_argmin(&hs[s.w_min..=s.w_max], h1, s.prime);
+        let h2 = h1 / 3 + (hs[m2] >> 2);
 
-        // Second window range for selecting m3
-        let w2_start = self.idx + self.w_max + self.w_min;
-        let mut w2_end = self.idx + (self.w_max << 1);
-        if w2_start > self.end_hash {
-            return None;
-        }
-        if w2_end > self.end_hash {
-            if !self.shrink {
-                return None;
-            }
-            w2_end = self.end_hash;
-        }
+        let w2_start = s.w_max + s.w_min;
+        let m3 = w2_start + masked_argmin(&hs[w2_start..], h2, s.prime);
+        let hash = h2 + hs[m3] / 5;
 
-        // Compute m1 (first k-mer)
-        self.h1 = self.hashes[self.idx];
-        // Select m2
-        let (pos2, _) = self.choose_min(self.h1, w1_start, w1_end)?;
-        self.idx2 = pos2;
-        self.h2 = self.h1 / 3 + (self.hashes[pos2] >> 2);
-
-        // Select m3
-        let (pos3, _) = self.choose_min(self.h2, w2_start, w2_end)?;
-        self.idx3 = pos3;
-        self.h3 = self.h2 + self.hashes[pos3] / 5;
-
-        // Advance to next starting index for m1
-        self.idx += 1;
-        Some(self.h3)
+        s.idx2 = s.idx + m2;
+        s.idx3 = s.idx + m3;
+        s.idx += 1;
+        Some(hash)
     }
 }
 
-/// Returns `(masked_candidate << 32) | offset` for the best position in `window`,
-/// where `masked_candidate` is `(base + window[offset]) & prime`.
-///
-/// Packing the offset into the low bits turns the argmin into a plain `min`
-/// reduction and keeps the earliest position among ties — the same choice the
-/// branchy form's strict `<` makes. Callers must ensure `prime <= u32::MAX` and
-/// `window.len() <= u32::MAX`, and `window` must not be empty.
-///
-/// AVX-512 has a 64-bit unsigned SIMD minimum (`vpminuq`), so there the plain
-/// loop vectorises on its own and beats any hand-unrolling.
-#[cfg(target_feature = "avx512f")]
-#[inline(always)]
-fn packed_argmin(window: &[u64], base: u64, prime: u64) -> u64 {
-    let mut best = u64::MAX;
-    for (off, &h) in window.iter().enumerate() {
-        best = best.min(((base.wrapping_add(h) & prime) << 32) | off as u64);
-    }
-    best
-}
-
-/// See the AVX-512 variant above for the packing scheme.
-///
-/// Without a 64-bit SIMD minimum a single `min` chain is latency bound at about
-/// one cycle per element, so four independent accumulators are used to let the
-/// CPU overlap four reductions.
-#[cfg(not(target_feature = "avx512f"))]
-#[inline(always)]
-fn packed_argmin(window: &[u64], base: u64, prime: u64) -> u64 {
-    // `as_chunks::<4>()` (what clippy suggests here) measured ~5% slower on this
-    // loop, so the runtime-length form is kept deliberately.
-    #[allow(clippy::chunks_exact_to_as_chunks)]
-    let mut chunks = window.chunks_exact(4);
-    let mut acc = [u64::MAX; 4];
-    let mut off = 0u64;
-
-    for c in &mut chunks {
-        for (j, &h) in c.iter().enumerate() {
-            acc[j] = acc[j].min(((base.wrapping_add(h) & prime) << 32) | (off + j as u64));
-        }
-        off += 4;
-    }
-    for (j, &h) in chunks.remainder().iter().enumerate() {
-        acc[0] = acc[0].min(((base.wrapping_add(h) & prime) << 32) | (off + j as u64));
-    }
-
-    acc[0].min(acc[1]).min(acc[2]).min(acc[3])
-}
-
-impl Iterator for RandStrobes {
-    type Item = u64;
-
-    /// Exact remaining length, so `collect()` allocates exactly once.
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.remaining();
-        (n, Some(n))
-    }
-
-    /// Advances the iterator, returning the next strobemer hash value.
-    ///
-    /// Dispatches to `next_order2` or `next_order3` based on `self.n`.
-    /// If `n` is not 2 or 3, returns `None`.
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.n {
-            2 => self.next_order2(),
-            3 => self.next_order3(),
-            _ => None, // Should not occur due to prior validation
-        }
-    }
-}
-
-/// Exact via [`Iterator::size_hint`].
-impl ExactSizeIterator for RandStrobes {}
+strobe_iterator!(RandStrobes);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{NtHash64, Strobemer};
 
     #[test]
     fn order2_basic() {
-        // Basic smoke test: sequence "ACGTACGTACGT", order=2, k=3, w_min=1, w_max=4
         let mut rs = RandStrobes::new("ACGTACGTACGT".as_bytes(), 2, 3, 1, 4).unwrap();
-        // Expect at least one strobemer
         assert!(rs.next().is_some());
     }
 
     #[test]
     fn order3_basic() {
-        // Basic smoke test: sequence repeated, order=3, k=3, w_min=1, w_max=4
         let seq = "ACGTACGTACGTACGTACGTACGT";
         let rs = RandStrobes::new(seq.as_bytes(), 3, 3, 1, 4).unwrap();
-        // Take first 10 strobemers; expect exactly 10 values
+        // The sequence yields more strobemers than are taken here.
         assert_eq!(rs.take(10).count(), 10);
+    }
+
+    /// Deterministic pseudo-random DNA.
+    fn random_seq(n: usize) -> Vec<u8> {
+        let mut state: u64 = 0x2545F491_4F6CDD1D;
+        const BASES: [u8; 4] = *b"ACGT";
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                BASES[(state >> 33) as usize & 3]
+            })
+            .collect()
+    }
+
+    /// Refilling the hash buffer must be invisible, wherever the boundaries
+    /// fall relative to the search windows and whatever the refill size.
+    /// Hashing everything up front is the reference.
+    #[test]
+    fn chunk_boundaries_are_invisible() {
+        let seq = random_seq(700);
+        for n in [2u8, 3] {
+            for (k, w_min, w_max) in [(3usize, 1usize, 1usize), (5, 2, 9), (7, 4, 4), (4, 1, 30)] {
+                for shrink in [true, false] {
+                    let mut want =
+                        RandStrobes::with_hasher(&seq, n, k, w_min, w_max, &NtHash64).unwrap();
+                    assert!(want.state.hashes.is_complete());
+                    want.set_window_shrink(shrink);
+                    let want: Vec<Strobemer> = want.with_positions().collect();
+                    assert!(!want.is_empty());
+
+                    for chunk in [1usize, 2, 3, 17, 64, 699, 5000] {
+                        let mut got =
+                            RandStrobes::with_chunk(&seq, n, k, w_min, w_max, chunk).unwrap();
+                        got.set_window_shrink(shrink);
+                        let got: Vec<Strobemer> = got.with_positions().collect();
+                        assert_eq!(
+                            got, want,
+                            "n={n} k={k} w=({w_min},{w_max}) shrink={shrink} chunk={chunk}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The default constructor streams once the sequence outgrows one refill,
+    /// and still agrees with hashing everything up front.
+    #[test]
+    fn long_sequences_are_streamed() {
+        let (k, w_min, w_max) = (21usize, 10usize, 25usize);
+        let seq = random_seq(4 * CHUNK_KMERS + 123);
+        for n in [2u8, 3] {
+            let streamed = RandStrobes::new(&seq, n, k, w_min, w_max).unwrap();
+            assert!(!streamed.state.hashes.is_complete());
+            let a: Vec<Strobemer> = streamed.with_positions().collect();
+            let b: Vec<Strobemer> = RandStrobes::with_hasher(&seq, n, k, w_min, w_max, &NtHash64)
+                .unwrap()
+                .with_positions()
+                .collect();
+            assert!(!a.is_empty());
+            assert!(a == b, "streaming disagrees for order {n}");
+        }
     }
 }

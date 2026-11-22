@@ -6,7 +6,7 @@
 [<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/haradama/strobemers-rs/rust.yml?branch=main&style=for-the-badge" height="20">](https://github.com/haradama/strobemers-rs/actions)
 
 Rust implementation of **strobemer** generation (MinStrobes, RandStrobes).  
-Streaming iterators produce 64-bit strobemer hashes over DNA/RNA sequences.
+Iterators produce 64-bit strobemer hashes, optionally with strobe positions, over DNA sequences.
 
 > **Background**  
 >
@@ -26,10 +26,11 @@ This crate provides:
 - **RandStrobes (order 2/3)**  
   Choose subsequent strobes by a pseudo-random but reproducible rule derived from hash values.
 
-Sequences must consist of `A`, `C`, `G`, `T`/`U` only. The default hasher skips
-`k`-mer windows containing any other base, which would break the mapping from
-hash index to sequence position, so such sequences are rejected with
-`StrobeError::IncompleteHashValues` (as in the Go reference).
+Sequences must consist of `A`, `C`, `G`, `T` only (either case). The default
+hasher has no value for a `k`-mer containing any other base — `N`, IUPAC codes,
+or `U`, so convert RNA to `T` first — and such sequences are rejected
+with `StrobeError::UnsupportedBase` rather than hashed with gaps — see
+[Sequences containing `N`](#sequences-containing-n).
 
 ## Installation
 
@@ -44,7 +45,7 @@ cargo add strobemers-rs
 ```rust
 use strobemers_rs::{MinStrobes, RandStrobes};
 
-fn main() -> anyhow::Result<()> {
+fn main() -> strobemers_rs::Result<()> {
     // Example DNA sequence
     let seq = b"ACGATCTGGTACCTAG";
     // k-mer length
@@ -55,66 +56,87 @@ fn main() -> anyhow::Result<()> {
 
     // MinStrobes order-2
     // Produces one 64-bit hash per position, selecting the minimum-hash strobe in [i+w_min .. i+w_max].
-    let mut min2 = MinStrobes::new(seq, 2, k, w_min, w_max)?;
-    while let Some(h) = min2.next() {
-        println!("MinStrobes(order=2) hash: {}", h);
+    for h in MinStrobes::new(seq, 2, k, w_min, w_max)? {
+        println!("MinStrobes(order=2) hash: {h}");
     }
 
     // MinStrobes order-3
     // Two-level selection: pick m2 in [i+w_min .. i+w_max], then m3 in
     // [i+w_max+w_min .. i+2*w_max]. Both windows are anchored on the position of
     // m1, not on where m2 happened to land.
-    let mut min3 = MinStrobes::new(seq, 3, k, w_min, w_max)?;
-    for (i, h) in min3.take(5).enumerate() {
-        let [m1, m2, m3_pos] = min3.indexes();
-        println!("MinStrobes(order=3)[{}] m1={} m2={} m3={} -> hash={}",
-            i, m1, m2, m3_pos, h);
+    //
+    // `with_positions()` yields the start of each strobe along with the hash.
+    let min3 = MinStrobes::new(seq, 3, k, w_min, w_max)?;
+    for (i, s) in min3.with_positions().take(5).enumerate() {
+        println!("MinStrobes(order=3)[{i}] m1={} m2={} m3={:?} -> hash={}",
+            s.m1, s.m2, s.m3, s.hash);
     }
 
     // RandStrobes order-2
     // Similar to MinStrobes, but the second strobe is chosen by a pseudo-random rule:
-    let mut rand2 = RandStrobes::new(seq, 2, k, w_min, w_max)?;
-    while let Some(h) = rand2.next() {
-        println!("RandStrobes(order=2) hash: {}", h);
+    for h in RandStrobes::new(seq, 2, k, w_min, w_max)? {
+        println!("RandStrobes(order=2) hash: {h}");
     }
 
     // RandStrobes order-3
-    let mut rand3 = RandStrobes::new(seq, 3, k, w_min, w_max)?;
-    for (i, h) in rand3.take(5).enumerate() {
-        let [m1, m2, m3_pos] = rand3.indexes();
-        println!("RandStrobes(order=3)[{}] m1={} m2={} m3={} -> hash={}",
-            i, m1, m2, m3_pos, h);
+    let rand3 = RandStrobes::new(seq, 3, k, w_min, w_max)?;
+    for (i, s) in rand3.with_positions().take(5).enumerate() {
+        println!("RandStrobes(order=3)[{i}] m1={} m2={} m3={:?} -> hash={}",
+            s.m1, s.m2, s.m3, s.hash);
     }
 
     Ok(())
 }
 ```
 
+## Sequences containing `N`
+
+A strobemer cannot span an ambiguous base, so the default hasher rejects the
+whole sequence with `StrobeError::UnsupportedBase`, which reports where the
+first such base is. `acgt_runs` splits a sequence into the stretches between
+them, each with its offset:
+
+```rust
+use strobemers_rs::{RandStrobes, StrobeError, acgt_runs};
+
+fn main() -> strobemers_rs::Result<()> {
+    let seq = b"ACGATCTGGTACCTAGNNNNTTGACCTGATCGATCGGGCTNAC";
+
+    for (offset, run) in acgt_runs(seq) {
+        let strobes = match RandStrobes::new(run, 2, 3, 3, 5) {
+            Ok(it) => it,
+            // This run is too short for the chosen parameters.
+            Err(StrobeError::SequenceTooShort) => continue,
+            Err(e) => return Err(e),
+        };
+        for s in strobes.with_positions() {
+            println!("m1={} m2={} hash={}", offset + s.m1, offset + s.m2, s.hash);
+        }
+    }
+    Ok(())
+}
+```
+
 ## Performance notes
 
-Both iterators precompute one 64-bit hash per k-mer up front, so scratch memory
-is 8 bytes per base. `MinStrobes` also needs the minimum of a sliding window: it
-precomputes that as a table — another 16 bytes per base — while the table stays
-cache-resident, and computes it online for longer sequences, keeping only
-`O(w_max)` entries. Scratch for a 20 Mbp sequence is therefore 152 MiB rather
-than 457 MiB, and per-base throughput stops degrading as the sequence grows.
+Iterators built with `new` borrow the sequence and hash it in chunks as they
+advance, so their memory use does not grow with the sequence length. `MinStrobes`
+also needs the minimum of a sliding window: for short sequences it hashes
+everything up front and precomputes the minima as a table, which is faster
+while the table stays cache-resident; for longer ones it computes them online,
+keeping only `O(w_max)` entries.
 
-Measured with `cargo bench` on a Xeon Platinum 8480+ over 1 Mbp of random DNA,
-`k = 31, w_min = 20, w_max = 50`:
-
-| | default target | `-C target-cpu=native` |
-|---|---|---|
-| `MinStrobes` order 2 | 25.9 ms | 26.4 ms |
-| `MinStrobes` order 3 | 30.1 ms | 30.6 ms |
-| `RandStrobes` order 2 | 30.8 ms | 21.1 ms |
-| `RandStrobes` order 3 | 55.1 ms | 39.4 ms |
+Iterators built with `with_hasher` call the custom hasher once, for the whole
+sequence, and own the resulting hashes — one 64-bit value per k-mer.
 
 `RandStrobes` picks its next strobe by minimising `(h1 + h2) & prime` over the
 window. With the default prime that reduces to a branchless 64-bit `min`, which
-vectorises into `vpminuq` when the target has AVX-512 — building with
-`RUSTFLAGS="-C target-cpu=native"` (or `-C target-cpu=x86-64-v4`) is worth about
-1.4x there. `MinStrobes` is unaffected, being bound by memory traffic rather
-than by that loop.
+vectorises into `vpminuq` when the target has AVX-512, so building with
+`RUSTFLAGS="-C target-cpu=native"` (or `-C target-cpu=x86-64-v4`) makes it
+noticeably faster there. `MinStrobes` is unaffected, being bound by memory
+traffic rather than by that loop.
+
+Run `cargo bench` to measure on your own hardware.
 
 Both iterators are [`ExactSizeIterator`], so `collect()` allocates exactly once.
 
@@ -123,8 +145,8 @@ Both iterators are [`ExactSizeIterator`], so `collect()` allocates exactly once.
 ## Using a Custom Hash Function
 
 By default, strobemers-rs uses [nthash-rs](https://github.com/haradama/nthash-rs) for k-mer hashing.
-However, you can inject your own hash function by implementing the `KmerHasher` trait and passing it via the with_hasher method. See [the example](./examples/custom_hash.rs) for more details.
+However, you can inject your own hash function by implementing the `KmerHasher` trait and passing it via the `with_hasher` method. See [the example](https://github.com/haradama/strobemers-rs/blob/main/examples/custom_hash.rs) for more details.
 
 ## License
 
-This project is MIT‑licensed (see [LICENSE](LICENSE)).
+This project is MIT‑licensed (see [LICENSE](https://github.com/haradama/strobemers-rs/blob/main/LICENSE)).

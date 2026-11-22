@@ -8,15 +8,39 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
 
 jobs:
-  build:
-
+  test:
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - uses: Swatinem/rust-cache@v2
+    - name: Format
+      run: cargo fmt --all --check
+    - name: Clippy
+      run: cargo clippy --all-targets -- -D warnings
+    - name: Test
+      run: cargo test
+    # The online window-minima path only engages on long sequences, and the
+    # argmin has overflow-sensitive packing; exercise both as shipped.
+    - name: Test (release)
+      run: cargo test --release
+    - name: Docs
+      run: cargo doc --no-deps
+    - name: Build benches
+      run: cargo bench --no-run
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    # Keep in sync with `rust-version` in Cargo.toml.
+    - uses: dtolnay/rust-toolchain@1.85
+    - uses: Swatinem/rust-cache@v2
+    - name: Check
+      run: cargo check --lib

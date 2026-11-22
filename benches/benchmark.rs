@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use strobemers_rs::{MinStrobes, RandStrobes};
+use strobemers_rs::{KmerHasher, MinStrobes, NtHash64, RandStrobes};
 
 use rand::{Rng, SeedableRng};
 use std::hint::black_box;
@@ -8,9 +8,9 @@ const L: usize = 31;
 const W_MIN: usize = 20;
 const W_MAX: usize = 50;
 
-/// Default working length. Large enough that the precomputed hash array
-/// (8 bytes per base, plus as much again for the window minima) no longer fits
-/// in L2, which is where genome-scale inputs live.
+/// Default working length. Large enough that the precomputed hash array and
+/// the window minima no longer fit in a typical L2 cache, which is the regime
+/// genome-scale inputs live in.
 const LEN: usize = 1_000_000;
 
 /// Generate a reproducible pseudo-random DNA sequence of `n` bases.
@@ -43,18 +43,14 @@ fn bench_iterators(c: &mut Criterion) {
     g.finish();
 }
 
-/// Isolates the k-mer hashing stage, which the iterators run up front and which
-/// dominates the cheaper MinStrobes configurations.
+/// Isolates the k-mer hashing stage, which dominates the cheaper MinStrobes
+/// configurations.
 fn bench_hashing(c: &mut Criterion) {
     let seq = make_seq(LEN);
     let mut g = c.benchmark_group("hashing");
     g.throughput(Throughput::Bytes(LEN as u64));
     g.bench_function("nthash", |b| {
-        b.iter(|| {
-            // Construction performs the hashing; order 2 adds the least on top.
-            let it = RandStrobes::new(&seq, 2, L, W_MIN, W_MAX).unwrap();
-            black_box(it);
-        })
+        b.iter(|| black_box(NtHash64.hash_all(black_box(&seq), L).unwrap()))
     });
     g.finish();
 }
@@ -74,24 +70,33 @@ fn bench_collect(c: &mut Criterion) {
     g.finish();
 }
 
-/// Per-base cost as the working set outgrows the caches. The iterators keep one
-/// `u64` per base (MinStrobes keeps three), so throughput here shows how much of
-/// the runtime is memory traffic rather than arithmetic.
+/// Per-base cost as the working set outgrows the caches. The iterators keep
+/// per-base state, so throughput here shows how much of the runtime is memory
+/// traffic rather than arithmetic, and where the `MinStrobes` window-minima
+/// strategies cross over.
 fn bench_scaling(c: &mut Criterion) {
+    const LENS: [usize; 6] = [10_000, 100_000, 200_000, 500_000, 1_000_000, 10_000_000];
+
     let mut g = c.benchmark_group("scaling/MinStrobes-order-2");
-    for len in [
-        10_000usize,
-        100_000,
-        200_000,
-        500_000,
-        1_000_000,
-        10_000_000,
-    ] {
+    for len in LENS {
         let seq = make_seq(len);
         g.throughput(Throughput::Bytes(len as u64));
         g.bench_with_input(BenchmarkId::from_parameter(len), &seq, |b, seq| {
             b.iter(|| {
                 let it = MinStrobes::new(seq, 2, L, W_MIN, W_MAX).unwrap();
+                let _sum: u64 = black_box(it).sum();
+            })
+        });
+    }
+    g.finish();
+
+    let mut g = c.benchmark_group("scaling/RandStrobes-order-2");
+    for len in LENS {
+        let seq = make_seq(len);
+        g.throughput(Throughput::Bytes(len as u64));
+        g.bench_with_input(BenchmarkId::from_parameter(len), &seq, |b, seq| {
+            b.iter(|| {
+                let it = RandStrobes::new(seq, 2, L, W_MIN, W_MAX).unwrap();
                 let _sum: u64 = black_box(it).sum();
             })
         });

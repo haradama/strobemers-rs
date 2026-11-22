@@ -4,7 +4,7 @@ fn main() -> Result<()> {
     // ---------------------------------------------------- //
     // 1. Input sequence and parameters
     // ---------------------------------------------------- //
-    // Sequence to process (25 nucleotides)
+    // Sequence to process
     let seq = "ATCGTACGATGCATGCATGCTGACG";
     // Order of strobemer: 2 (dimer) or 3 (trimer)
     let n = 2;

@@ -32,22 +32,27 @@ impl KmerHasher for ShortHasher {
 /// `nthash-rs` skips every k-mer window containing a non-ACGT base, so the hash
 /// vector becomes shorter than the sequence and its indices no longer line up
 /// with sequence positions. That used to yield strobes at shifted positions and
-/// then panic with an out-of-bounds index; it must be reported as an error, as
-/// the Go reference does with `ErrIncompleteHashValues`.
+/// then panic with an out-of-bounds index; it must be reported as an error.
+/// The Go reference reports a bare `ErrIncompleteHashValues`; this crate names
+/// the offending base and its position.
 #[test]
 fn ambiguous_base_is_rejected() {
     let with_n: &[u8] = b"ACGATCTGGTANCTAGGCTTACGATCAGT";
     let clean: &[u8] = b"ACGATCTGGTACCTAGGCTTACGATCAGT";
+    let unsupported = StrobeError::UnsupportedBase {
+        position: 11,
+        byte: b'N',
+    };
 
     for n in [2u8, 3] {
         assert_eq!(
             RandStrobes::new(with_n, n, 3, 3, 5).err(),
-            Some(StrobeError::IncompleteHashValues),
+            Some(unsupported.clone()),
             "RandStrobes must reject a sequence containing N (order {n})"
         );
         assert_eq!(
             MinStrobes::new(with_n, n, 3, 3, 5).err(),
-            Some(StrobeError::IncompleteHashValues),
+            Some(unsupported.clone()),
             "MinStrobes must reject a sequence containing N (order {n})"
         );
         // The same sequence without the ambiguous base still works.
@@ -200,5 +205,68 @@ fn set_prime_accepts_large_values() -> Result<()> {
         RandStrobes::new(seq, 2, 3, 1, 4)?.set_prime(255).err(),
         Some(StrobeError::PrimeNumberTooSmall)
     );
+    Ok(())
+}
+
+/// A window offset near `usize::MAX` used to overflow the length check — a
+/// panic in debug builds, and in release a wrapped value that let the request
+/// through. No sequence is that long, so it is simply too short.
+#[test]
+fn huge_window_offsets_are_rejected() {
+    let seq: &[u8] = b"ACGATCTGGTACCTAG";
+    for n in [2u8, 3] {
+        for w_max in [usize::MAX, usize::MAX / 2 + 1, usize::MAX / 2] {
+            assert_eq!(
+                RandStrobes::new(seq, n, 3, 1, w_max).err(),
+                Some(StrobeError::SequenceTooShort),
+                "RandStrobes n={n} w_max={w_max}"
+            );
+            assert_eq!(
+                MinStrobes::new(seq, n, 3, 1, w_max).err(),
+                Some(StrobeError::SequenceTooShort),
+                "MinStrobes n={n} w_max={w_max}"
+            );
+        }
+    }
+}
+
+/// A sequence with no hashable k-mer at all, and one whose only ambiguous base
+/// is lowercase or a `U`, are reported the same way as the general case.
+#[test]
+fn unsupported_base_position_is_the_first_one() {
+    assert_eq!(
+        MinStrobes::new(b"NNNNNNNNNNNNNNNN", 2, 3, 1, 4).err(),
+        Some(StrobeError::UnsupportedBase {
+            position: 0,
+            byte: b'N'
+        })
+    );
+    assert_eq!(
+        RandStrobes::new(b"acgatctggtaccnagn", 2, 3, 1, 4).err(),
+        Some(StrobeError::UnsupportedBase {
+            position: 13,
+            byte: b'n'
+        })
+    );
+    // Lowercase input is fine.
+    assert!(RandStrobes::new(b"acgatctggtacctag", 2, 3, 1, 4).is_ok());
+    // `nthash-rs` has no seed for `U`, so RNA is reported like any other
+    // unsupported base rather than as a bare length mismatch.
+    assert_eq!(
+        RandStrobes::new(b"ACGAUCUGGUACCUAG", 2, 3, 1, 4).err(),
+        Some(StrobeError::UnsupportedBase {
+            position: 4,
+            byte: b'U'
+        })
+    );
+}
+
+/// `with_hasher` accepts a trait object, and hashers need not be thread-safe.
+#[test]
+fn hasher_can_be_a_trait_object() -> Result<()> {
+    let hasher: Box<dyn KmerHasher> = Box::new(HugeHasher);
+    let seq: &[u8] = b"ACGTACGTACGTACGTACGTACGT";
+    assert!(MinStrobes::with_hasher(seq, 2, 3, 1, 4, hasher.as_ref())?.count() > 0);
+    assert!(RandStrobes::with_hasher(seq, 2, 3, 1, 4, &*hasher)?.count() > 0);
     Ok(())
 }
